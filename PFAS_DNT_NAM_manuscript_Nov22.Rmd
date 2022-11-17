@@ -1,0 +1,3304 @@
+---
+title: "Manuscipt: DNT NAMs for PFAS"
+author: "KEC"
+date: "11/03/2022"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide 
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+library(ggplot2)
+library(stats)
+library(gplots)
+library(dplyr)
+library(data.table)
+library(stringr)
+library(openxlsx)
+library(viridis)
+library(gridExtra)
+library(factoextra)
+library(randomForest)
+library(caret)
+library(Metrics)
+library(reshape2)
+library(tcpl)
+library(corrplot)
+library(knitr)
+library(DT)
+library(VennDiagram)
+library(ggpubr)
+library(scales)
+library(RColorBrewer)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+sessionInfo()
+```
+
+# 1. Load and filter PFAS screening data in the DNT NAMs
+
+## Load multi-concentration and single-concentration screening data
+Data source file includes:
+1. Assay information table including ID and assay endpoint name.
+2. Multi-concentration (mc) data including ToxCast Analysis Pipeline (tcpl) levels 1-6.
+3. Single-concentration (sc) data including tcpl levels 1 and 2.
+
+More information on tcpl data processing and retrieval: https://cran.r-project.org/web/packages/tcpl/vignettes/
+
+```{r warning=FALSE, message=FALSE}
+
+tcplConf(user='', pass='', #insert user and pass
+         db='prod_internal_invitrodb_v3_5', drvr='MySQL', 
+         host='ccte-mysql-res.epa.gov') #insert host
+
+#-----------------------------------------------------------------------------------#
+# Load mc and sc data from 'prod_internal_invitrodb_v3_5' database and add flags to mc5 data
+#-----------------------------------------------------------------------------------#
+
+# Load mc data
+# neuro.asids <- c(20,31)
+# neuro.assays <- tcplLoadAeid(val=neuro.asids, fld='asid',add.fld='acid')
+# 
+# mc0.neuro <- tcplPrepOtpt(tcplLoadData(lvl=0,type='mc', fld='acid',val=neuro.assays$acid))
+# mc1.neuro <- tcplPrepOtpt(tcplLoadData(lvl=1,type='mc', fld='acid',val=neuro.assays$acid))
+# mc2.neuro <- tcplPrepOtpt(tcplLoadData(lvl=2, type='mc',fld='acid',val=neuro.assays$acid))
+# mc3.neuro <- tcplPrepOtpt(tcplLoadData(lvl=3, type='mc',fld='aeid',val=neuro.assays$aeid))
+# mc5.neuro <- tcplPrepOtpt(tcplLoadData(lvl=5,type='mc', fld='aeid',val=neuro.assays$aeid))
+# mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5.neuro$m4id, type='mc'))
+# setDT(mc6)
+# mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+# mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+# mc5.neuro$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5.neuro$m4id, mc6_mthds$m4id)]
+# mc5.neuro[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+# mc5.neuro[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+# mc5.neuro[hitc==1,acc_uM := ifelse(!is.na(modl_acc), 10^modl_ga, NA)]
+# 
+# # Load sc data
+# sc2.neuro <- tcplPrepOtpt(tcplLoadData(lvl=2, type='sc',fld='aeid',val=neuro.assays$aeid))
+# sc1.neuro <- tcplPrepOtpt(tcplLoadData(lvl=1, type='sc',fld='aeid',val=neuro.assays$aeid))
+# 
+# save(mc0.neuro,
+#      mc1.neuro,
+#      mc2.neuro,
+#      mc3.neuro,
+#      mc5.neuro,
+#      mc6,
+#      neuro.assays,
+#      sc2.neuro,
+#      sc1.neuro,
+#      file="./source/mc_tcpl_neuro_Nov22_prod_v3_v5.RData")
+
+#load(file='./source/mc_sc_tcpl_neuro_invitrodb_snapshot_28Feb22.RData')
+
+load(file="./source/mc_tcpl_neuro_Nov22_prod_v3_v5.RData")
+
+```
+
+## Apply coarse filters to mc5 data
+```{r warning=FALSE, message=FALSE}
+
+# Filter the mc5 dataset with coarse filters
+mc5_filter <- function(df) {
+df[, use.me := 0]
+df[hitc==1 & flag.length < 3, use.me := 1]
+df[hitc==1 & is.na(flag.length), use.me := 1]
+df[hitc==1 & flag.length >= 3, use.me := 0]
+df[fitc %in% c(36,45), use.me := 0]
+df[hitc==-1, use.me := 0] # make hitc interpretable as a positive sum
+df[use.me==0, modl_ga := as.numeric(NA)]
+df[use.me==0, hitc := 0]
+df[hitc==0, modl_ga := as.numeric(NA)]
+}
+
+mc5.neuro <- mc5_filter(mc5.neuro)
+mc5.neuro <- mc5.neuro[!is.na(casn),] # Remove control rows, e.g. DMSO/ water
+mc2.neuro <- mc2.neuro[!is.na(casn),] # Remove control rows, e.g. DMSO/ water
+
+```
+
+## Subset tcpl data by PFAS chemicals
+```{r warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Load list of PFAS to use as a filter
+#-----------------------------------------------------------------------------------#
+# List of PFAS from Tim Shafer's lab of screened PFAS in MEA and HCI assays (note not all chemicals were screened on the list)
+
+pfas.master <- setDT(read.xlsx("input/All_PFAS_Shafer_screen_June22.xlsx")) 
+
+#mc vs sc ID
+mc5.neuro[, is.mc := 1]
+sc2.neuro[, is.sc := 1]
+
+mc5.neuro.pfas <- mc5.neuro[casn %in% pfas.master$CASRN, ] # only pfas chems in mc5 data
+sc2.neuro.pfas <- sc2.neuro[casn %in% pfas.master$CASRN, ] # only pfas chems in sc2 data
+
+```
+
+## Filter DNT NAM endpoints and Add assay description
+```{r warning=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Exclude non-relevant endpoints
+#-----------------------------------------------------------------------------------#
+
+# mc
+exclude <- c("acute","MFR","CCTE_Shafer_MEA_LDH","CCTE_Shafer_MEA_AB","_up",
+             "Cortical", "CCTE_Mundy_HCI_hNP1_Pro_MeanAvgInten_loss")
+mc5.neuro.pfas2 <- mc5.neuro.pfas[!grep(paste(exclude, collapse="|"),aenm),]
+
+# sc
+exclude <- c("MEA_MFR_dn","Shafer_MEA_LDH","Shafer_MEA_AB","_up",
+             "CCTE_Mundy_HCI_hNP1_Pro_MeanAvgInten_loss")
+sc2.neuro.pfas2 <- sc2.neuro.pfas[!grep(paste(exclude, collapse="|"),aenm),]
+
+#-----------------------------------------------------------------------------------#
+# Add assay descriptions
+#-----------------------------------------------------------------------------------#
+
+activity.tbl.colors <- as.data.table(read.xlsx("input/Activity_tbl_HCI_NFA_categories_colors3_NFA_update.xlsx"))
+# mc
+mc5.neuro.pfas2$activity <- activity.tbl.colors$activity4[match(mc5.neuro.pfas2$aenm, activity.tbl.colors$aenm)] # sc
+sc2.neuro.pfas2$activity <- activity.tbl.colors$activity4[match(sc2.neuro.pfas2$aenm, activity.tbl.colors$aenm)]
+
+# add assay description to mc
+mc5.neuro.pfas2[, assay:= "MEA NFA"]
+mc5.neuro.pfas2[grep("NOG",activity), assay:= "NOG initiation, CDI"]
+mc5.neuro.pfas2[grep("Apoptosis",activity), assay:= "Apoptosis, hNP1"]
+mc5.neuro.pfas2[grep("Proliferation",activity), assay:= "Proliferation, hNP1"]
+# add assay column to sc data
+sc2.neuro.pfas2$assay <- mc5.neuro.pfas2$assay[match(sc2.neuro.pfas2$aenm, mc5.neuro.pfas2$aenm)]
+
+# add second assay description with cyto endpoints identified
+mc5.neuro.pfas2[, assay2:= assay]
+cyto.aenm <- c("CCTE_Mundy_HCI_CDI_NOG_NeuronCount_loss",
+               "CCTE_Mundy_HCI_hNP1_Pro_ObjectCount_loss",
+               "CCTE_Mundy_HCI_hNP1_CellTiter_loss",
+               "CCTE_Shafer_MEA_dev_LDH_dn",
+               "CCTE_Shafer_MEA_dev_AB_dn")
+mc5.neuro.pfas2[aenm %in% cyto.aenm, assay2:= "Cytotoxicity"]
+sc2.neuro.pfas2$assay2 <- mc5.neuro.pfas2$assay2[match(sc2.neuro.pfas2$aenm, mc5.neuro.pfas2$aenm)]
+
+#add assay technology column
+mc5.neuro.pfas2[, assay.tech := "HCI"]
+mc5.neuro.pfas2[assay %in% "MEA NFA", assay.tech := "MEA NFA"]
+sc2.neuro.pfas2$assay.tech <- mc5.neuro.pfas2$assay.tech[match(sc2.neuro.pfas2$aenm, mc5.neuro.pfas2$aenm)]
+
+```
+
+## Reprocurement landscape
+There were three iterations of PFAS procurement between 2018 and 2019.
+
+1. 2018 procurement set should have been tested in only mc MEA NFA
+Citation for EPA 2018 procurement: https://comptox.epa.gov/dashboard/chemical-lists/EPAPFAS75S1
+Note: The set of 75 samples consists of 74 unique substances (DTXSID3037709, Potassium perfluorohexanesulfonate duplicated in set, procured from 2 different suppliers).
+
+2. 2019 procurement sets were screened in a tiered approach where the chemicals were first tested in single-concentration and subsequently screened in multi-concentration if they were active. 
+
+```{r, warning=FALSE, message=FALSE}
+#-----------------------------------------------------------------------------------#
+# Load PFAS procurement lists from Shafer lab
+#-----------------------------------------------------------------------------------#
+pfas2018 <- setDT(read.xlsx("input/EPA_9238_EPA-Shafer_75_20180511_key_MW Waste Calculations.xlsx"))
+pfas2019a <- setDT(read.xlsx("input/EPA_27864_EPA-Shafer_134_20191001_key.xlsx"))
+pfas2019b <- setDT(read.xlsx("input/EPA_29885_EPA-Shafer_36_20191112_key.xlsx"))
+
+
+#-----------------------------------------------------------------------------------#
+# 2018 procurement
+#-----------------------------------------------------------------------------------#
+
+# Were all the chemicals in PFAS 2018 pipelined in tcpl?
+all.pfas <- unique(c(sc2.neuro.pfas2$casn, mc5.neuro.pfas2$casn))
+
+pfas2018.casn <- unique(pfas2018$CASRN)
+setdiff(pfas2018.casn, all.pfas) #one chemical on this list that was not pipelined: "45187-15-3"
+unique(mc5.neuro[spid %in% "1483035",casn])
+# Amy Carpenter noted that the casn is 'incorrect' in the Shafer mapping file and the SPID "1483035" is actually linked to "375-73-5"
+pfas2018 <- pfas2018[CASRN %in% "45187-15-3", CASRN := "375-73-5"]
+setdiff(pfas2018$CASRN, all.pfas)
+
+# How many chemicals were screened in 2018 (first procurement)?
+length(unique(pfas2018$CASRN)) #74 unique PFAS
+
+# This first procurement was only screened in mc MEA NFA according to Shafer lab. Confirm:
+# source file data is in level 1 mc data
+pfas2018.srcf <- unique(mc1.neuro[spid %in% pfas2018$EPA_Sample_ID,
+                                  c('chnm','casn','dsstox_substance_id','spid','srcf')]) #TRUE, all MEA NFA
+
+pfas2018.spid <- unique(pfas2018.srcf[,c('chnm','casn','spid')])
+duplicated(pfas2018.spid$chnm) #note that Potassium perfluorohexanesulfonate was tested twice in the 2018 procurement so 73 unique chemicals were screened in the 2018 procurement
+
+#-----------------------------------------------------------------------------------#
+# 2019 procurement
+#-----------------------------------------------------------------------------------#
+pfas2019.all <- rbind(pfas2019a,pfas2019b, fill=TRUE)
+unique(pfas2019.all$CASRN)
+
+# sc
+pfas2019.tcpl.sc <- sc2.neuro[spid %in% pfas2019.all$EPA_SAMPLE_ID,]
+length(unique(pfas2019.tcpl.sc$casn)) #136 were screened in sc. 
+
+# mc
+pfas2019.tcpl.mc <- mc1.neuro[spid %in% pfas2019.all$EPA_SAMPLE_ID,]
+length(unique(pfas2019.tcpl.mc$casn)) #75 were in mc5. Next double check source file to make sure it's MEA NFA data
+length(unique(pfas2019.tcpl.mc[grep("MEA_dev",acnm),casn])) #42 unique PFAS were screened in MEA NFA (5 of these were not screened in sc)
+length(unique(pfas2019.tcpl.mc[grep("HCI_",acnm),casn])) #57 unique PFAS were screened in HCI
+
+#-----------------------------------------------------------------------------------#
+# Number of PFAS screened from both 2018 and 2019 procurement
+#-----------------------------------------------------------------------------------#
+
+# duplicates between 2018 and 2019 screening in mc MEA NFA data----------
+mea <- mc5.neuro.pfas2[grep("MEA_dev",aenm),]
+mea2018 <- mea[spid %in% pfas2018$EPA_Sample_ID,casn]
+mea2019 <- mea[spid %in% pfas2019.all$EPA_SAMPLE_ID,casn]
+intersect(mea2018,mea2019) #13 repeats between the two procurements
+
+# how many unique chemicals were screened in mc screening 
+length(unique(mc5.neuro.pfas2[,casn])) #124
+
+# how many unique chemicals were screened in sc screening
+length(unique(sc2.neuro.pfas2[,casn])) #136
+
+```
+
+## Exclude repeats in data(keep most active/ most potent)
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# tcplSubsetChid
+#-----------------------------------------------------------------------------------#
+
+# tcplsubsetchid:if a chemical is tested more than once (a chid has more than one spid) for a given assay endpoint, the function uses a series of logic to select a single "representative" sample 
+
+# mc5.neuro.pfas3 <- tcplSubsetChid(mc5.neuro.pfas2)
+# write.xlsx(mc5.neuro.pfas3,'output/tcpl_subset_chid_03Nov22.xlsx')
+mc5.neuro.pfas3 <- as.data.table(read.xlsx('output/tcpl_subset_chid_03Nov22.xlsx'))
+
+#find dups in the sc2 data--------------------------------------------------
+sc2.dups <- unique(sc2.neuro.pfas2[,c('casn','spid')])
+table(duplicated(sc2.dups$casn)) # no dups
+
+sc2.neuro.pfas3 <- sc2.neuro.pfas2
+```
+
+## Selective ativity (Exclude hits above cytotoxicity AC50 for each assay)
+
+For each assay component: 
+1. Identify cyto cutoff (cytoAC50 or min cytoAC50 in the case of MEA assay with 2 cyto measurements).
+2. Replace any mold_ga above cyto AC50 with NA.
+3. Replace any hitc above cyto AC50 with 0.
+
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Write 'selectivity' function for each assay
+#-----------------------------------------------------------------------------------#
+
+# Add binary cyto label
+mc5.neuro.pfas3[, is.cyto:= 0]
+mc5.neuro.pfas3[assay2 %in% "Cytotoxicity", is.cyto:= 1]
+
+# Selectivity function (one cyto endpoint per assay)----------------------------------
+nog.apop.pro <- mc5.neuro.pfas3[!assay %in% "MEA NFA",]
+summary(nog.apop.pro$modl_ga)
+
+sel.fun <- function(df){ #Each assay must include 1 cyto endpoint with 'is.cyto==1'.
+sel.list <<- list()
+for(i in unique(df$assay)){
+    df2 <- df[assay %in% i,]
+    cyto.df <- df2[is.cyto==1,]
+    cyto1 <- cyto.df[hitc==1, cyto.ac50 := modl_ga]
+    df2$cyto.ac50 <- cyto1$cyto.ac50[match(df2$casn,cyto1$casn)]
+    df3 <- df2[modl_ga>cyto.ac50, modl_ga := NA]
+    name <- paste(i)
+    sel.list[[name]] <- df3
+}
+sel.data <<- do.call("rbind",sel.list) #output
+}
+
+sel.fun(nog.apop.pro)
+nog.apop.pro.sel <- sel.data
+
+# Selectivity function (2 cyto endpoints per assay (MEA)------------------------------
+mea <- mc5.neuro.pfas3[assay %in% "MEA NFA",]
+
+sel.fun.mea <- function(df){ #Each assay must include 1 cyto endpoint with 'is.cyto==1'.
+    cyto.df <- df[is.cyto==1,]
+    cyto.df[, hitsum.cyto := sum(hitc),by='casn']
+    
+    cyto1 <- cyto.df[hitc==1 & hitsum.cyto==1,]
+    cyto1[hitc==1, cyto.ac50 := modl_ga]
+    cyto1.sum <- unique(cyto1[,c('casn','cyto.ac50')])
+    
+    cyto2 <- cyto.df[hitsum.cyto==2,]
+    cyto2[, cyto.ac50 := min(modl_ga), by=casn]
+    cyto2[, cyto.ac50 := ifelse(is.infinite(cyto.ac50),NA, cyto.ac50)]
+    cyto2.sum <- unique(cyto2[,c('casn','cyto.ac50')])
+    
+    cyto.sum <<- rbind(cyto1.sum, cyto2.sum)
+    
+    df$cyto.ac50 <- cyto.sum$cyto.ac50[match(df$casn, cyto.sum$casn)]
+    df2 <- df[modl_ga>cyto.ac50, modl_ga := NA] 
+    mea.sel <<- df2[is.na(modl_ga), hitc:= 0] #output
+}
+sel.fun.mea(mea)
+
+#-----------------------------------------------------------------------------------#
+# Create new table of selective PFAS activity 
+#-----------------------------------------------------------------------------------#
+# modl_ga == "NA" if modl_ga was below cytotoxicity ac50 for each chemical per assay
+# hitc == 0 if modl_ga was below cytotoxicity ac50 for each chemical per assay
+
+mc5.neuro.pfas4 <- rbind(mea.sel, nog.apop.pro.sel)
+```
+
+## Apply 3BMAD coff to sc data
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Replace sc cutoff (coff) from 2BMAD to 3BMAD
+#-----------------------------------------------------------------------------------#
+
+# Sc cutoff is set to 2BMAD for single conc screening, but for the purpose of comparing results to mc cutoffs (3BMAD), here we are replacing sc 2BMAD with 3BMAD
+
+sc2.neuro.pfas3[, coff2 := (bmad*3)]
+sc2.neuro.pfas3[, hitc2 := ifelse(max_med>coff2, 1,0)]
+sc2.neuro.pfas4 <- sc2.neuro.pfas3[, hitc := hitc2]
+
+```
+
+## Add chemical abbreviations
+```{r  results=FALSE, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Include abbreviations for specific PFAS, e.g. 'PFOS' or 'PFOA'
+#-----------------------------------------------------------------------------------#
+
+all.chems <- unique(rbind(sc2.neuro.pfas4[,c('dsstox_substance_id','casn','chnm')],mc5.neuro.pfas4[,c('dsstox_substance_id','casn','chnm')]))
+casn.all <- all.chems$casn
+
+short <- setDT(read.xlsx('input/PFAS_shortname_casn.xlsx'))
+short <- short[casn %in% all.chems$casn,]
+short$DTXSID <- all.chems$dsstox_substance_id[match(short$casn,all.chems$casn)]
+short$chnm <- all.chems$chnm[match(short$casn,all.chems$casn)]
+
+```
+
+# 2. Load QC data
+
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Load QC data from Barbara Wetmore
+#-----------------------------------------------------------------------------------#
+
+wetmore <- setDT(read.xlsx('input/PFAS150_QC_Summary_UNABRIDGED_2022_06_23.xlsx', sheet=2))
+
+#-----------------------------------------------------------------------------------#
+# Filter pass/ fails for duplicates and align with samples in DNT dataset 
+#-----------------------------------------------------------------------------------#
+names(wetmore)
+table(duplicated(wetmore$DTXSID))
+
+# Filter step 1, only chems in this study and only SOLVENT= DMSO
+wetmore1 <- wetmore[DTXSID %in% all.chems$dsstox_substance_id &
+                      SOLVENT %in% "DMSO",]
+head(wetmore1)
+
+# first bind data for the most recent QC curation
+wetmore2 <- wetmore1[ SET_3_.DMSO_134 ==1, ]
+
+qc1 <- unique(wetmore2[, c('DTXSID','SOLVENT','P/F.Score','Flag','QC_FAIL')])
+table(duplicated(qc1$DTXSID)) # 126 PFAS with QC data from QC set 3 data
+
+# what data is available for the rest of the PFAS
+rest.chems <- all.chems[!dsstox_substance_id %in% qc1$DTXSID,] # chems that need qc data
+
+qc2 <- wetmore1[DTXSID %in% rest.chems$dsstox_substance_id,]
+setdiff(rest.chems$dsstox_substance_id, qc2$DTXSID) #all data is available
+# are there duplicates?
+table(duplicated(qc2$DTXSID)) # none, so add this to the qc 1 data
+
+qc2 <- unique(qc2[, c('DTXSID','SOLVENT','P/F.Score','Flag','QC_FAIL')])
+
+qc <- rbind(qc1, qc2)
+table(is.na(qc$`P/F.Score`)) # all data is available
+
+```
+
+## Match QC data by samples
+```{r, warning=FALSE, message=FALSE}
+# 
+# #-----------------------------------------------------------------------------------#
+# # Load chemical information from Shafer lab for each procurement
+# #-----------------------------------------------------------------------------------#
+# pfas2018 <- setDT(read.xlsx("input/EPA_9238_EPA-Shafer_75_20180511_key_MW Waste Calculations.xlsx"))
+# pfas2019a <- setDT(read.xlsx("input/EPA_27864_EPA-Shafer_134_20191001_key.xlsx"))
+# pfas2019b <- setDT(read.xlsx("input/EPA_29885_EPA-Shafer_36_20191112_key.xlsx"))
+# 
+# #-----------------------------------------------------------------------------------#
+# # Align QC results by 'Bottle_id'
+# #-----------------------------------------------------------------------------------#
+# # make a master list of all spids in the ToxCast database for PFAS chems
+# set1 <- unique(mc5.neuro.pfas[, c('dsstox_substance_id', 'spid')])
+# set2 <- unique(sc2.neuro.pfas[, c('dsstox_substance_id', 'spid')])
+# tcpl.spids <- unique(rbind(set1,set2))
+# 
+# # make a master list of all spids on the 3 lists from the lab
+# spid1 <- pfas2018[, c('DTXSID', 'EPA_Sample_ID','Bottle_ID'),]
+# setnames(spid1, "EPA_Sample_ID", "EPA_SAMPLE_ID")
+# setnames(spid1, "Bottle_ID", "BOTTLE_ID")
+# spid2 <- pfas2019a[, c('DTXSID', 'EPA_SAMPLE_ID','BOTTLE_ID')]
+# spid3 <- pfas2019b[, c('DTXSID', 'EPA_SAMPLE_ID','BOTTLE_ID')]
+# 
+# spid.lab <- unique(rbind(spid1,spid2,spid3))
+# spid.lab <- spid.lab[DTXSID %in% tcpl.spids$dsstox_substance_id,]
+# 
+# # are there any Sample ID's that are in the ToxCast database that are not in the procurement
+# setdiff(tcpl.spids$spid, spid.lab$EPA_SAMPLE_ID) # there are 6 that I will have to manually match
+# 
+# # Sample ID in wetmore table is not the same as EPA_sample or SPID from the tcpl data
+# # need to use bottle information to bind the QC data
+# tcpl.spids$BOTTLE_ID <- spid.lab$BOTTLE_ID[match(tcpl.spids$spid, spid.lab$EPA_SAMPLE_ID)]
+# 
+# qc.merge1 <- merge(tcpl.spids, wetmore1, by='BOTTLE_ID', all.x=T) # many did not bind by bottle so I will add qc information separately
+# 
+# # pfas where the SPID did not match with a 'BOTTLE_ID' directly
+# qc.unknown <- qc.merge1[is.na(QC_FAIL),]
+# 
+# # pfas where the spid DID match the 'BOTTLE_ID"
+# qc.final <- qc.merge1[!is.na(QC_FAIL),] #this current list of a row for each spid, but ultimately, bc we use tcplsubsetChid and remove the least active sample, I want QC data bound to DTXSID,  not by spid.
+# 
+# qc.final <- unique(qc.final[, c('DTXSID','SOLVENT','P/F.Score','Flag','QC_FAIL')]) # remove spid component
+# table(duplicated(qc.final$DTXSID))
+# 
+# qc.unknown <- qc.unknown[!dsstox_substance_id %in% qc.final$DTXSID,]
+# qc.unknown <- unique(qc.unknown$dsstox_substance_id) # remove spid component
+# 
+# # look at the original QC data for the DTXSID with no match bottle id
+# filter.qc <- wetmore1[DTXSID %in% qc.unknown,]
+# filter.qc1 <- unique(filter.qc[, c('DTXSID','SOLVENT','P/F.Score','Flag','QC_FAIL')])
+# duplicates.qc <- filter.qc1[duplicated(DTXSID),] # these have different scores or flags for each iteration
+# 
+# # not duplicates and can use to add to qc.final
+# add.qc <- filter.qc1[!DTXSID %in% duplicates.qc$DTXSID,]
+# table(duplicated(add.qc$DTXSID))
+# qc.merge2 <- rbind(qc.final, add.qc)
+# 
+# # still need to figure out duplicates
+# dups.all.info <- wetmore1[DTXSID %in% duplicates.qc$DTXSID,]
+# # ask barbara; determined going to use the data from the 'SET_3_.DMSO_134' ==1 column
+# # write.csv(dups.all.info, "output/PFAS_diff_score_no_bottle_match.csv")
+# 
+# add.qc2 <- dups.all.info[SET_3_.DMSO_134 ==1, ]
+# add.qc2 <- add.qc2[, c('DTXSID','SOLVENT','P/F.Score','Flag','QC_FAIL')]
+# table(duplicated(add.qc2$DTXSID))
+# 
+# qc.merge3 <- rbind(qc.merge2, add.qc2)
+# table(duplicated(qc.merge3$DTXSID)) # 160 PFAS, no duplicates and all QC data present
+# table(is.na(qc.merge3$`P/F.Score`))
+# 
+# qc <- qc.merge3                         
+```
+
+# 3. Load OECD-map structural categories
+
+## Supplemental Figure 1
+```{r warning=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# OECD-map structure categories from Grace Patlewicz
+#-----------------------------------------------------------------------------------#
+
+oecd.class <- as.data.table(read.xlsx('input/PFAS wide chemical categories_RJ_06242022.xlsx'))
+
+setdiff(casn.all, oecd.class$casrn) #all PFAS in this dataset are included in the file
+
+df.class <- as.data.frame(casn.all)
+df.class$cat <- oecd.class$value[match(df.class$casn.all,oecd.class$casrn)]
+df.class <- as.data.table(df.class)
+table(df.class$cat)
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(df.class, aes(reorder(cat, cat,
+                     function(x)+length(x)))) +
+  geom_bar(fill = "#B3CDE3") +
+  scale_y_continuous(breaks = seq(0,70,10))+
+  theme_minimal() +
+  coord_flip() +
+  theme(text= element_text(size=14))+
+  labs(y="Number of PFAS",
+       x="")
+
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/fig_PFAS_structure_cat_mc_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path,
+    width = 8,
+    height = 3, #change from 8 to 20
+    units = "in",
+    res = 300)
+p
+dev.off()
+
+```
+
+# 4. DNT NAM activity by hitcall
+
+## Hitsum summary (define acitve/ inactive/ equivocal) by chemical
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Calculate hit sum for activity table
+#-----------------------------------------------------------------------------------#
+
+# mc hitsum
+mc5.neuro.pfas4[, mc.hitsum := sum(hitc), by=casn]
+mc5.neuro.pfas4[, mc.n.test.end := .N, by=casn]
+mc5.neuro.pfas4[, mc.perc.active := round(mc.hitsum/mc.n.test.end*100,2), by=casn]
+
+# sc hitsum
+sc2.neuro.pfas4[, sc.hitsum := sum(hitc), by=casn]
+sc2.neuro.pfas4[, sc.n.test.end := .N, by=casn]
+sc2.neuro.pfas4[, sc.perc.active := round(sc.hitsum/sc.n.test.end*100,2), by=casn]
+
+mc5.merge <- unique(mc5.neuro.pfas4[,c('dsstox_substance_id','casn','chnm','mc.hitsum','mc.n.test.end','mc.perc.active')])
+sc2.merge <- unique(sc2.neuro.pfas4[,c('dsstox_substance_id','casn','chnm','sc.hitsum','sc.n.test.end','sc.perc.active')])
+
+tbl.tested <- merge(sc2.merge, mc5.merge, by=c('casn','dsstox_substance_id'), all=TRUE)
+
+#-----------------------------------------------------------------------------------#
+# Add QC data to activity table
+#-----------------------------------------------------------------------------------#
+
+tbl.tested$P.F <- qc$`P/F.Score`[match(tbl.tested$dsstox_substance_id,qc$DTXSID)]
+tbl.tested$QC.flags <- qc$Flag[match(tbl.tested$dsstox_substance_id,qc$DTXSID)]
+tbl.tested <- tbl.tested[, QC_fail := ifelse(P.F %in% "F",1,0)]
+tbl.tested$synonym <- short$shortname[match(tbl.tested$casn,short$casn)]
+
+#-----------------------------------------------------------------------------------#
+# Define active/ inactive/ equivocal
+#-----------------------------------------------------------------------------------#
+
+# Column indicating whether chemical was tested in sc or mc
+tbl.tested[, sc.tested := ifelse(is.na(sc.hitsum),0,1)]
+tbl.tested[, mc.tested := ifelse(is.na(mc.hitsum),0,1)]
+
+# Define inactive as zero hits and active as having one active endpoint
+tbl.tested[, is.active := ifelse(mc.hitsum==0, "Inactive", "Active")]
+# For PFAS not screened in mc:
+tbl.tested[mc.tested==0, is.active := ifelse(sc.hitsum==0, "Inactive", "Active")]
+
+# Rule: if active in only 1/17 MEA NFA endpoints (not cyto)== Equivocal
+mc5.neuro.pfas4[, hitsum := sum(hitc), by=casn]
+mc5.dev.1hit <- mc5.neuro.pfas4[grep("dev",aenm),]
+mc5.1hit <- mc5.dev.1hit[hitsum==1 & hitc==1,]
+mc5.1hit <- mc5.1hit[!assay2 %in% "Cytotoxicity",]
+
+tbl.tested[, is.active3 := is.active]
+tbl.tested <- tbl.tested[mc.hitsum ==1 & 
+                           casn %in% mc5.1hit$casn, is.active3 := "Equivocal"]
+tbl.tested <- tbl.tested[is.active3 %in% "Equivocal", is.active := "Inactive"]
+
+# Add overall percent activity column 
+tbl.tested[, perc.active := mc.perc.active]
+tbl.tested[mc.tested==0, perc.active := sc.perc.active]
+
+# Summary stats for abstract
+active.sum <- tbl.tested[is.active %in% "Active",]
+nrow(active.sum)
+table(active.sum$QC_fail)
+
+inactive.sum <- tbl.tested[is.active %in% "Inactive",]
+nrow(inactive.sum)
+table(inactive.sum$QC_fail)
+
+```
+
+## Hitsum summary by assay
+```{r, warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Calculate hit sum by assay for mc and sc
+#-----------------------------------------------------------------------------------#
+mc5.neuro.pfas4[, hitsum.assay := sum(hitc, na.rm=T), by=c('assay','casn')]
+sc2.neuro.pfas4[, hitsum.assay := sum(hitc, na.rm=T), by=c('assay','casn')]
+
+mc5.hit.assay <- unique(mc5.neuro.pfas4[, c('casn','dsstox_substance_id','chnm','assay','hitsum.assay')])
+mc5.hit.assay[, activity := ifelse(hitsum.assay==0, "Inactive","Active")]
+
+sc2.hit.assay <- unique(sc2.neuro.pfas4[, c('casn','dsstox_substance_id','chnm','assay','hitsum.assay')])
+sc2.hit.assay[, activity := ifelse(hitsum.assay==0, "Inactive","Active")]
+
+# Create table where each chemical has a row for each of the 4 assays
+hit.assay <- tbl.tested[, c('casn','dsstox_substance_id','QC_fail')]
+hit.assay <- hit.assay[rep(seq_len(nrow(hit.assay)), each=4)]
+
+assays <- unique(mc5.neuro.pfas4$assay) 
+assay.vec <- rep(assays, times=160)
+hit.assay$assay <- assay.vec
+
+# Add mc activity
+hit.assay <- merge(hit.assay, mc5.hit.assay[, c('casn','assay','hitsum.assay')],
+                   by=c('casn','assay'), all.x=T)
+setnames(hit.assay,"hitsum.assay","mc.hitsum")
+hit.assay[, mc.activity := mc.hitsum]
+hit.assay[mc.activity>0, mc.activity := 1]
+
+# Add sc activity
+hit.assay <- merge(hit.assay, sc2.hit.assay[, c('casn','assay','hitsum.assay')],
+                   by=c('casn','assay'), all.x=T)
+setnames(hit.assay,"hitsum.assay","sc.hitsum")
+hit.assay[, sc.activity := sc.hitsum]
+hit.assay[sc.activity>0, sc.activity := 1]
+
+```
+
+## Figure 1A: Bioactivity by assay
+```{r , warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Prep table for plot
+#-----------------------------------------------------------------------------------#
+
+# Add endpoint Key for mc and sc (casn_aenm)
+mc5.neuro.pfas4[, key := paste0(casn,"_",aenm)]
+sc2.neuro.pfas4[, key := paste0(casn,"_",aenm)]
+sc2.neuro.pfas4 <- sc2.neuro.pfas4[!key %in% mc5.hitsum$key,]
+
+# rbind mc and sc; assay2 includes a cytotoxicity label for any cyto endpoint
+mc5.hitsum <- mc5.neuro.pfas4[, c('casn','dsstox_substance_id','aenm','aeid','hitc','assay2','assay.tech','key')]
+sc2.hitsum <- sc2.neuro.pfas4[, c('casn','dsstox_substance_id','aenm','aeid','hitc','assay2','assay.tech','key')]
+mc5.sc2.bind <- rbind(mc5.hitsum, sc2.hitsum)
+
+# Determine number of chems per activity type (mc only)
+assay.sum <- unique(mc5.sc2.bind[,c('casn','assay2')])
+assay.sum2 <- as.data.table(table(assay.sum$assay))
+
+# Hits by assay type
+mc5.sc2.bind[, hitsum.assay := sum(hitc), by=c('casn','assay2')]
+mc5.sc2.bind[, hitsum.assay2 := 0]
+mc5.sc2.bind[hitsum.assay>0, hitsum.assay2 := 1,] # binary hit column
+
+assay.sum3 <- unique(mc5.sc2.bind[,c('casn','assay2','hitsum.assay2')])
+assay.sum3[, hitsum.assay3 := sum(hitsum.assay2), by=assay2]
+assay.sum4 <- unique(assay.sum3[,c('assay2','hitsum.assay3')])
+assay.sum2$hitsum.assay <- assay.sum4$hitsum.assay3[match(assay.sum2$V1,assay.sum4$assay2)]
+
+# Add percent active column (number of pfas active/ number of pfas tested by assay)
+assay.sum2[, perc.active := round((hitsum.assay/N)*100,2)]
+assay.sum2[, fraction := paste0(hitsum.assay,"/",N)]
+setnames(assay.sum2,"V1","assay")
+
+assay.sum2$assay.tech <- mc5.sc2.bind$assay.tech[match(assay.sum2$assay,mc5.sc2.bind$assay2)]
+assay.sum2[assay %in% "Cytotoxicity", assay.tech := "Cytotoxicity"]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(assay.sum2, aes(x=reorder(assay, -perc.active), y=perc.active, fill=assay.tech))+
+geom_bar(stat="identity", color="black")+
+scale_fill_brewer(palette="Pastel1")+
+  theme_minimal()+
+  ylim(0,30)+
+  ggtitle("MC hits + SC hits with 3BMAD coff")+
+  labs(x="", y = "Percent active")+
+  theme(text = element_text(size = 18)) +
+  theme(panel.border = element_rect(color = "gray",
+                                    fill = NA,
+                                    size = 1))+
+    geom_text(aes(label=fraction), vjust=1.6, color="black",
+            position = position_dodge(0.9), size=4)+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+p
+
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/fig_Gen_activity_by_activity3_mc_sc_3bmad_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path,
+    width = 10,
+    height = 6, #change from 8 to 20
+    units = "in",
+    res = 300)
+p
+dev.off()
+
+```
+
+## Figure 1B: Potency range by DNT activity type
+```{r warning=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Prep table for plot 
+#-----------------------------------------------------------------------------------#
+df <- mc5.neuro.pfas4
+
+df[, activity.type := activity]
+df[assay2 %in% "Cytotoxicity", activity.type := "Cytotoxicity"]
+df[,med.ac50 := median(modl_ga, na.rm=TRUE), by=activity.type]
+df[assay2 %in% "Cytotoxicity", assay.tech := "Cytotoxicity"]
+df$assay.tech <- factor(df$assay.tech, levels=c("MEA NFA","HCI","Cytotoxicity"))
+df$QC_fail <- tbl.tested$QC_fail[match(df$casn,tbl.tested$casn)]
+df$is.active <- tbl.tested$is.active3[match(df$casn,tbl.tested$casn)]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+brewer.pal(n=3,name="Pastel1")
+
+p <- ggplot(data=df, aes(x=reorder(factor(activity.type), -med.ac50), y=modl_ga, fill=assay.tech))+
+  geom_boxplot(outlier.shape=NA, alpha=0.8,
+               width=0.4)+
+  geom_jitter(width=0.1, size=2, alpha=0.75,
+              aes(shape=factor(QC_fail),
+                  color=factor(is.active)))+
+  scale_fill_manual(values=c("#FBB4AE", "#B3CDE3", "#CCEBC5"),
+                    breaks=c("Cytotoxicity","HCI","MEA NFA"))+
+  scale_shape_manual(values=c(16,8))+
+  scale_color_manual(values=c('gray60','red','red'))+
+  xlab("")+
+  ylab('log10 AC50 (uM)')+
+  theme_bw() +
+  coord_flip()+
+  theme(legend.position="bottom")+
+  labs(fill = "")+
+  theme(axis.text.y= element_text(size=12))
+p
+
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_ac50_range_activity_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 8.5, height = 5, unit='in',res = 600)
+p
+dev.off()
+
+#-----------------------------------------------------------------------------------#
+# Potency stats for manuscript
+#-----------------------------------------------------------------------------------#
+
+#which chem was active in apoptosis
+df.apop <- df[aenm %in% "CCTE_Mundy_HCI_hNP1_Casp3_7_gain" &
+                hitc==1,]
+df.apop$chnm
+
+median(mc5.neuro.pfas4$modl_ga, na.rm=TRUE)
+mean(mc5.neuro.pfas4$modl_ga, na.rm=TRUE)
+sd(mc5.neuro.pfas4$modl_ga, na.rm=TRUE)
+
+mc5.neuro.pfas4[activity.type %in% "General activity", median(modl_ga, na.rm=TRUE)]
+mc5.neuro.pfas4[activity.type %in% "General activity", sd(modl_ga, na.rm=TRUE)]
+
+mc5.neuro.pfas4[activity.type %in% "NOG initiation, CDI", median(modl_ga, na.rm=TRUE)]
+mc5.neuro.pfas4[activity.type %in% "NOG initiation, CDI", sd(modl_ga, na.rm=TRUE)]
+
+# Check that data normally distributed
+hist(mc5.neuro.pfas4$modl_ga, col='steelblue', main='Normal') # bell shaped
+qqnorm(mc5.neuro.pfas4$modl_ga)
+qqline(mc5.neuro.pfas4$modl_ga) # data falls along a straight diagonal line
+shapiro.test(mc5.neuro.pfas4$modl_ga) # p<0.05; data are normally distributed
+
+# Formally test for equality of the variances with a Levene’s or Bartlett’s test
+activity.stats <- mc5.neuro.pfas4[!activity.type %in% c("Apoptosis, hNP1","Proliferation, hNP1")]
+activity.stats$activity.type <- as.factor(activity.stats$activity.type)
+unique(activity.stats$activity.type)
+
+library(car)
+leveneTest(modl_ga ~ activity.type, data=activity.stats)
+# The p-value being larger than the significance level of 0.05, we do not reject the null hypothesis, so we cannot reject the hypothesis that variances are equal between groups.
+
+# Is the potency different between groups; ANOVA
+aggregate(modl_ga ~ activity.type, data=mc5.neuro.pfas4,
+  function(x) round(c(mean = mean(x), sd = sd(x)), 2)
+)
+aggregate(modl_ga ~ activity.type, data=activity.stats,
+  function(x) round(c(mean = mean(x), sd = sd(x)), 2)
+)
+oneway.test(modl_ga ~ activity.type, data=activity.stats,
+  var.equal = TRUE # assuming equal variances
+)
+res_aov <- aov(modl_ga ~ activity.type, data=activity.stats
+)
+res_aov
+
+library(report)
+report(res_aov)
+
+#post-hoc test
+library(multcomp)
+# Tukey HSD test:
+post_test <- glht(res_aov,
+  linfct = mcp(activity.type = "Tukey")
+)
+class(post_test)
+
+library(broom)
+
+sum.stats.pot <- tidy(post_test)
+
+# Range
+mc5.neuro.pfas4$qc.fail <- tbl.tested$QC_fail[match(mc5.neuro.pfas4$casn,tbl.tested$casn)]
+max <- mc5.neuro.pfas4[!qc.fail==1, max(modl_ga, na.rm=TRUE)]
+max
+min <- mc5.neuro.pfas4[!qc.fail==1, min(modl_ga, na.rm=TRUE)]
+min
+max-min
+
+# Repeat with percentiles
+max.95 <- mc5.neuro.pfas4[!qc.fail==1, max(modl_ga, na.rm=TRUE)]
+max.95
+min.5 <- mc5.neuro.pfas4[!qc.fail==1, min(modl_ga, na.rm=TRUE)]
+min.5
+max.95-min.5
+```
+
+# 5. Most sensitive endpoints
+
+## Supp Figure 4Ai: Histogram by endpoints
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Setup table for plot
+#-----------------------------------------------------------------------------------#
+
+dnt.df <- mc5.neuro.pfas4
+dnt.df$qc.fail <- tbl.tested$QC_fail[match(dnt.df$casn,tbl.tested$casn)]
+dnt.df[, activity.type := activity]
+dnt.df[assay2 %in% "Cytotoxicity", activity.type := "Cytotoxicity"]
+dnt.df[assay2 %in% "Cytotoxicity", assay.tech := "Cytotoxicity"]
+dnt.df$assay.tech <- as.factor(dnt.df$assay.tech)
+
+# Add most sensitive endpoint column by modl_ga (AC50)
+dnt.df[,min.modl.ga.chnm := min(modl_ga, na.rm=TRUE), by=casn]
+dnt.df[,min.modl.ga.chnm := ifelse(is.infinite(min.modl.ga.chnm), NA, min.modl.ga.chnm)]
+dnt.df[min.modl.ga.chnm == modl_ga, min.aenm := paste(aenm)]
+dnt.df[min.aenm==aenm, min.assay := paste(assay)]
+
+# Frequency table for minimum AC50 defined by assay
+library(plyr)
+freq.min.assay <- as.data.table(count(dnt.df, 'min.assay'))
+freq.min.assay <- freq.min.assay[!is.na(min.assay),]
+
+# Frequency table for minimum AC50 defined by endpoint
+freq.min.aenm <- as.data.table(count(dnt.df, 'min.aenm'))
+freq.min.aenm <- freq.min.aenm[!is.na(min.aenm),]
+setorder(freq.min.aenm, freq)
+
+# Add 'activity type' colors for histogram
+freq.min.aenm$number <- activity.tbl.colors$number5[match(freq.min.aenm$min.aenm, activity.tbl.colors$aenm)]
+freq.min.aenm$activity<- activity.tbl.colors$activity5[match(freq.min.aenm$min.aenm, activity.tbl.colors$aenm)]
+
+#-----------------------------------------------------------------------------------#
+# Stats for manuscript
+#-----------------------------------------------------------------------------------#
+
+# Table of only min.aenm data
+min.aenm.tb <- dnt.df[!is.na(min.aenm),]
+# mean ac50 for bursting electrode down that defined the min potency by chemical
+min.aenm.tb[aenm %in% "CCTE_Shafer_MEA_dev_bursting_electrodes_number_dn" &
+              !qc.fail ==1,
+            mean(modl_ga, na.rm=T)]
+min.aenm.tb[aenm %in% "CCTE_Shafer_MEA_dev_bursting_electrodes_number_dn" &
+              !qc.fail ==1,
+            sd(modl_ga, na.rm=T)]
+# mean ac50 for bursting electrode down that defined the min potency by chemical
+min.aenm.tb[aenm %in% "CCTE_Mundy_HCI_CDI_NOG_NeuriteLength_loss"  &
+              !qc.fail ==1,
+            mean(modl_ga, na.rm=T)]
+min.aenm.tb[aenm %in% "CCTE_Mundy_HCI_CDI_NOG_NeuriteLength_loss"  &
+              !qc.fail ==1,
+            sd(modl_ga, na.rm=T)]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+df <- freq.min.aenm
+df$min.aenm <- factor(df$min.aenm, levels=df$min.aenm)
+col <- as.character(df$number)
+activity <- as.character(df$activity)
+df[grep("HCI",min.aenm),assay.tech := "HCI"]
+df[grep("dev_",min.aenm),assay.tech := "MEA NFA"]
+df$assay.tech <- factor(df$assay.tech, levels=c("MEA NFA","HCI"))
+
+p <- df %>%  
+  ggplot() +
+  geom_col(
+    mapping = aes(
+      x = min.aenm,
+      y = freq,
+      fill = activity,
+      group = min.aenm
+    ),
+    stat = "identity",
+    position = "dodge"
+  ) +
+ theme_bw()+
+ ylab("PFAS compounds (freq)") +
+  xlab("") +  theme(legend.position = "bottom") +
+  scale_fill_manual(breaks=c(activity), values=c(col))+
+  facet_grid(assay.tech ~ ., scales = "free_y") +
+theme(plot.margin = unit(c(0.5, 1, 0.5, 0.5), "in"))+
+  coord_flip()
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_hist_most_sensitive_end_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 8, height = 7, unit='in',res = 600)
+p
+dev.off()
+
+```
+
+
+## Supplemental Figure 4B and C: evaluate 'bursting_electrodes_dn' endpoint
+
+```{r  fig.height=8, fig.width=12}
+
+#-----------------------------------------------------------------------------------#
+# Explore PFAS for which the min potency was identified by bursting_electrode
+#-----------------------------------------------------------------------------------#
+min.bursting.chem <- dnt.df[min.aenm %in% 'CCTE_Shafer_MEA_dev_bursting_electrodes_number_dn',casn]
+burst.aenm.hit <- mc5.neuro.pfas4[aenm %in% "CCTE_Shafer_MEA_dev_bursting_electrodes_number_dn" &
+                                    hitc==1,]
+
+# Examine other hits by these 8 compounds
+min.bursting.chem.tbl <- mc5.neuro.pfas4[casn %in% min.bursting.chem & hitc==1,
+                                      c('casn','aenm','hitc','modl_ga','mc6_flags')]
+burst.tbl <- mc5.neuro.pfas4[casn %in% min.bursting.chem & hitc==1,
+                             c('dsstox_substance_id','casn','aenm','hitc','modl_ga','mc6_flags')]
+burst.tbl.stat <- burst.tbl[, hitsum := sum(hitc), by=casn]
+burst.tbl.stat <- burst.tbl[, mean.ac50 := mean(modl_ga,na.rm=TRUE), by=casn]
+burst.tbl.stat <- burst.tbl[, mean.ac50.uM := 10^mean.ac50, by=casn] 
+burst.tbl.stat <- burst.tbl[, sd.ac50 := sd(modl_ga,na.rm=TRUE), by=casn]
+burst.tbl.stat <- burst.tbl[, sd.ac50.uM := 10^sd.ac50, by=casn] 
+burst.tbl.stat$n.endpoints.tested <- tbl.tested$mc.n.test.end[match(burst.tbl.stat$casn,tbl.tested$casn)]
+burst.tbl.stat$QC.fail <- tbl.tested$P.F[match(burst.tbl.stat$casn,tbl.tested$casn)]
+
+burst.tbl.stat <- unique(burst.tbl.stat[, c('dsstox_substance_id','casn','hitsum','n.endpoints.tested','mean.ac50','sd.ac50',
+                                            'mean.ac50.uM','sd.ac50.uM', 'QC.fail')])
+write.xlsx(burst.tbl.stat,'output/Supp_Fig4C_min_ac50_bursting_electrode.xlsx') #Supplemental Figure 4C
+
+# Stats for results
+mean(burst.tbl.stat$mean.ac50.uM)
+burst.tbl.stat[!casn %in% "678-78-4", mean(mean.ac50)] # exclude qc fail
+burst.tbl.stat[!casn %in% "678-78-4", sd(mean.ac50)] # exclude qc fail
+
+
+
+#-----------------------------------------------------------------------------------#
+# Data to generate tcpl concentration response curves; Supplemental Figure 4B
+#-----------------------------------------------------------------------------------#
+
+graph <- burst.aenm.hit
+#tcplPlotM4ID(graph$m4id, lvl=6)
+
+# graphics.off()
+# pdf(file=paste('figures/Tcpl_pfas_hits_bursting_electrode_',
+#                format(Sys.Date(),
+#                       "%y%m%d.pdf"),
+#                sep="_"),
+#     height=6,
+#     width=10,
+#     pointsize=10)
+# for (a in graph$m5id){
+#   tcplPlotM4ID(graph[m5id==a]$m4id, lvl=6)
+#   mtext(paste(unique(graph[m5id==a]$aenm)), outer=FALSE, cex=1, line=1.5, adj=0)
+# }
+# graphics.off()
+
+```
+
+## Supplemental Figure 4Aii: Table of mean AC50 by endpoint
+
+```{r  fig.height=8, fig.width=12}
+
+stat.min.ac50 <- mc5.neuro.pfas4
+stat.min.ac50$qc.fail <- tbl.tested$QC_fail[match(stat.min.ac50$casn, tbl.tested$casn)]
+stat.min.ac50 <- stat.min.ac50[!qc.fail==1,]
+
+stat.min.ac50[, mean.ac50.aenm := mean(modl_ga, na.rm=T), by=aenm]
+stat.min.ac50[, sd.ac50.aenm := sd(modl_ga, na.rm=T), by=aenm]
+stat.min.ac50.tb <- unique(stat.min.ac50[,c('aenm','mean.ac50.aenm','sd.ac50.aenm')])[order(mean.ac50.aenm)]
+write.xlsx(stat.min.ac50.tb, 'output/Supplemental_Figure4_mean_ac50_by_aenm.xlsx') # Supplemental Table 4Aii
+
+```
+
+# 6. Efficacy (AUC)
+
+## AUC function
+```{r Matrix for AUC MEA heatmap, results= "hide", warning=FALSE, message=FALSE}
+
+auc_function <- function(mc5.for.auc){
+# functions needed to fit
+hill_curve <- function(hill_tp, hill_ga, hill_gw, lconc){
+  return(hill_tp/(1+10^((hill_ga - lconc)*hill_gw)))
+}
+
+gnls_curve <- function(top, ga, gw, la, lw, lconc){
+  gain <- 1/(1+10^((ga - lconc)*gw))
+  loss <- 1/(1+10^((lconc - la)*lw))
+  return(top*gain*loss)
+}
+
+# fit all hitc==1 curves in the mc5
+mc5.for.auc[ use.me==1L & modl == "hill", 
+    auc := mapply(function(lower, 
+                           upper, 
+                           hill_tp, 
+                           hill_ga, 
+                           hill_gw) integrate(hill_curve, 
+                                              lower, 
+                                              upper, 
+                                              hill_tp=hill_tp, 
+                                              hill_ga=hill_ga, 
+                                              hill_gw=hill_gw)$value,
+                  lower = mc5.for.auc[use.me ==1L & modl == "hill", logc_min], 
+                  upper = mc5.for.auc[use.me ==1L & modl == "hill", logc_max], 
+                  hill_tp = mc5.for.auc[use.me ==1L & modl == "hill", hill_tp], 
+                  hill_ga = mc5.for.auc[use.me ==1L & modl == "hill", hill_ga], 
+                  hill_gw = mc5.for.auc[use.me ==1L & modl == "hill", hill_gw])]
+
+mc5.for.auc[ use.me==1L & modl == "gnls", 
+    auc := mapply(function(lower, 
+                           upper, 
+                           top, 
+                           ga, 
+                           gw, 
+                           la, 
+                           lw) integrate(gnls_curve, 
+                                         lower, 
+                                         upper, 
+                                         top=top, 
+                                         ga=ga, 
+                                         gw=gw, 
+                                         la=la, 
+                                         lw=lw)$value,
+                  lower = mc5.for.auc[use.me ==1L & modl == "gnls", logc_min], 
+                  upper = mc5.for.auc[use.me ==1L & modl == "gnls", logc_max], 
+                  top = mc5.for.auc[use.me ==1L & modl == "gnls", gnls_tp], 
+                  ga = mc5.for.auc[use.me ==1L & modl == "gnls", gnls_ga], 
+                  gw = mc5.for.auc[use.me ==1L & modl == "gnls", gnls_gw],
+                  la = mc5.for.auc[use.me ==1L & modl == "gnls", gnls_la], 
+                  lw = mc5.for.auc[use.me ==1L & modl == "gnls", gnls_lw])]
+}
+```
+
+## Compute AUC for selective hits in MEA NFA
+```{r Matrix for AUC MEA heatmap, results= "hide", warning=FALSE, message=FALSE}
+
+auc.sel.dev <- mc5.neuro.pfas4[grep("dev",aenm),]
+
+#-----------------------------------------------------------------------------------#
+# Include positive DNT reference chemical
+#-----------------------------------------------------------------------------------#
+hg.pos <- mc5.neuro[ chnm %in% "Tributyltin methacrylate", ]
+hg.pos <- hg.pos[aenm %in% auc.sel.dev$aenm,]
+hg.pos.test <- hg.pos[,c('aenm','hitc','modl_ga')]
+# Cytotox activity for positive control
+hg.pos.cyto <- hg.pos[aeid %in% c(2529,2530)]
+hg.pos.cyto[, cyto.ac50 := min(modl_ga, na.rm=T), by=casn]
+hg.pos$cyto.ac50 <- hg.pos.cyto$cyto.ac50[match(hg.pos$casn, hg.pos.cyto$casn)]
+# Replace modl_ga and hitc for non-selective activity
+hg.pos <- hg.pos[modl_ga>cyto.ac50, modl_ga := NA]
+# Add pos control to df
+mc5.mea.dev <- rbind(auc.sel.dev, hg.pos, fill=TRUE)
+
+#-----------------------------------------------------------------------------------#
+# Compute AUC
+#-----------------------------------------------------------------------------------#
+
+mc5.mea.dev <- auc_function(mc5.mea.dev)
+
+# Exclude auc's above non-selective hits (modl_ga column is only selective hits in mc5.neuro.pfas4)
+mc5.mea.dev[is.na(modl_ga), auc := NA]
+
+#-----------------------------------------------------------------------------------#
+# Stats for results section
+#-----------------------------------------------------------------------------------#
+
+summary(mc5.mea.dev$auc) 
+hist(mc5.mea.dev$auc, breaks=150)
+
+# Sum AUC for each chemical
+mc5.mea.dev[,auc.sum.mea := sum(auc, na.rm=T), by= casn]
+mc5.mea.dev <- mc5.mea.dev[!auc.sum.mea==0,]
+# Take the log2 of the sum
+mc5.mea.dev[, log2.auc.mea.sum := ifelse(!is.na(auc.sum.mea), log2(auc.sum.mea), NA)]
+# Find the 95th percentile
+mc5.mea.dev[, log2.auc.mea.sum.95 := ifelse(!is.na(log2.auc.mea.sum), quantile(log2.auc.mea.sum, 0.95, na.rm=T), NA)]
+mea95 <- quantile(mc5.mea.dev$log2.auc.mea.sum, 0.95, na.rm=TRUE)
+# Make a scaled AUC by dividing the log2 by the quantile
+mc5.mea.dev[,scaled.auc.mea := ifelse(!is.na(log2.auc.mea.sum), round(log2.auc.mea.sum/mea95, 2), NA)]
+mc5.mea.dev[,scaled.auc.mea := ifelse(is.infinite(scaled.auc.mea), 0, scaled.auc.mea)]
+
+# Make summary table
+mea.auc.sum <- unique(mc5.mea.dev[,c('chnm','casn','hitsum','scaled.auc.mea','log2.auc.mea.sum')])
+tbl.tested$auc.sum.log2 <- mea.auc.sum$log2.auc.mea.sum[match(tbl.tested$casn,mea.auc.sum$casn)]
+
+```
+
+## Supplemental Figure 6: Ranked AUC MEA NFA
+```{r results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+#-----------------------------------------------------------------------------------#
+# Table for plot
+#-----------------------------------------------------------------------------------#
+auc.sum <- unique(mc5.mea.dev[,c('chnm','dsstox_substance_id','casn','log2.auc.mea.sum')])[order(log2.auc.mea.sum)]
+auc.sum[, rank := rev(1:nrow(auc.sum))]
+auc.sum$cat <- oecd.class$value[match(auc.sum$casn,oecd.class$casrn)]
+
+auc.sum <- auc.sum[casn %in% "335-67-1", dsstox_substance_id := "   PFOA"]
+auc.sum <- auc.sum[casn %in% "2155-70-6", dsstox_substance_id := "Tributyltin"]
+auc.sum <- auc.sum[is.na(cat), cat := "DNT Positive"]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+p <- ggplot(auc.sum, aes(x=log2.auc.mea.sum, y=as.factor(rank), shape=cat))+
+  geom_point(size=3) +
+  annotate(geom="text", x=auc.sum$log2.auc.mea.sum, y=auc.sum$rank,
+           label=auc.sum$dsstox_substance_id,
+           hjust= -0.2)+
+  theme_bw()+
+  #xlim(3,14)+
+  theme(text= element_text(size=14))+
+  xlab("AUC sum (log2)")+
+  ylab("Rank order")+
+  #scale_y_discrete(limits = rev(levels(rank)))+
+  scale_color_brewer(palette="Set2") +
+    guides(shape=guide_legend(nrow=4,byrow=TRUE,
+                              keyheight=0.06,
+                              title="PFAS-Map OECD\nStructural Category"))+
+  theme(legend.position="top")
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_NFA_rank_auc_sum_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 9.5, 
+    height = 9, #change from 8 to 20
+    units = "in",
+    res = 600)
+p
+dev.off()
+
+```
+
+# 7. Trends in PFAS chemical properties 
+
+## PFAS chemical property flags added (mc and sc)
+```{r results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+# Query dashboard for physicochemicals properties and OPERA predictors
+opera.tb <- setDT(read.xlsx("input/CCD-Batch-Search_2022-06-23_08_23_36.xlsx"))
+setnames(opera.tb,"INPUT","CASRN")
+
+assignPropertiesFlags <- function(opera.tb) {
+
+  require(data.table)
+  setDT(opera.tb)
+
+  # data prep - make columns numeric
+  num_cols <- c("AVERAGE_MASS","ATMOSPHERIC_HYDROXYLATION_RATE_(AOH)_CM3/MOLECULE*SEC_OPERA_PRED", "BIOCONCENTRATION_FACTOR_OPERA_PRED",
+                "BOILING_POINT_DEGC_OPERA_PRED","HENRYS_LAW_ATM-M3/MOLE_OPERA_PRED",
+                "OPERA_KM_DAYS_OPERA_PRED","OCTANOL_AIR_PARTITION_COEFF_LOGKOA_OPERA_PRED",
+                "SOIL_ADSORPTION_COEFFICIENT_KOC_L/KG_OPERA_PRED","OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED",
+                "MELTING_POINT_DEGC_OPERA_PRED","VAPOR_PRESSURE_MMHG_OPERA_PRED","log10VP","log10.BCF")
+  #opera.tb[, c(num_cols) := lapply(.SD, function(x) suppressWarnings(as.numeric(x))), .SDcols = num_cols]
+
+  # take log10 where needed
+  opera.tb[, c("log10.BCF") := log10(BIOCONCENTRATION_FACTOR_OPERA_PRED)]
+  opera.tb[, c("log10VP") := log10(VAPOR_PRESSURE_MMHG_OPERA_PRED)]
+
+  # flag volatile compounds, where log10VP > -1
+  opera.tb[log10VP > 2, volatility_flag := 1]
+  opera.tb[log10VP <= 2, volatility_flag := 0]
+
+  # flag compounds with low molecular weight
+  # from dashboard: The average mass is calculated based on the general distribution of atomic weights for the various isotopes.
+  # I assume this is right units, g/mol is pretty standard
+  opera.tb[AVERAGE_MASS < 80, low_mw_flag := 1]
+  opera.tb[AVERAGE_MASS >= 80, low_mw_flag := 0]
+
+
+  # Octanol-water partition logP
+  # (measure how the amount of a substance dissolves in octanol (very hydrophobic) versus the amount of the substance that will dissolve in water)
+  # for water: log (0 / 1) => -inf
+  # for octanol: log (1 / 0) => +inf
+  # a substance that dissolves equally well in both: log (x / x) = 0
+  # somethign that dissolves slightly better in octanol: log( 0.75 / 0.6) = 0.22
+  # best logP ranges: 1-7. Less than -1 or greater than 12 seems suspect
+  opera.tb[, logP_flag := 0] # initalize
+  opera.tb[OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED < -1 |
+             OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED > 12, logP_flag := 1]
+
+  # Bioaccumulation factor
+  opera.tb[log10.BCF > 5, bcf_flag := 1]
+  opera.tb[log10.BCF <= 5, bcf_flag := 0]
+
+  usecols <- c('DTXSID',
+               'PREFERRED_NAME',
+               'DTXSID',
+               'CASRN',
+               #'INCHIKEY',
+
+               'volatility_flag',
+               'low_mw_flag',
+               'logP_flag',
+               'bcf_flag')
+
+  return(opera.tb[, .SD, .SDcols = intersect(names(opera.tb),usecols)])
+
+}
+
+# Join flags with Dashboard OPERA features
+results.flags <- assignPropertiesFlags(opera.tb)
+
+```
+
+## Create table of Bioactivity and Physicochem and QC data
+
+```{r results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+# Add physicochemical properties to bioactivity table
+dat <- tbl.tested
+dat[, sc.mc := ""]
+dat[sc.tested ==1, sc.mc := "sc"]
+dat[mc.tested ==1, sc.mc := "mc"]
+
+dat$MW <- opera.tb$AVERAGE_MASS[match(dat$casn, opera.tb$CASRN)]
+dat$logP <- opera.tb$OCTANOL_WATER_PARTITION_LOGP_OPERA_PRED[match(dat$casn, opera.tb$CASRN)]
+dat$BP <- opera.tb$BOILING_POINT_DEGC_OPERA_PRED[match(dat$casn, opera.tb$CASRN)]
+dat$VP <- opera.tb$VAPOR_PRESSURE_MMHG_OPERA_PRED[match(dat$casn, opera.tb$CASRN)]
+dat$log10.VP <- opera.tb$log10VP[match(dat$casn, opera.tb$CASRN)]
+table(dat$QC_fail)
+dat$chnm <- mc5.neuro$chnm[match(dat$casn, mc5.neuro$casn)]
+
+# Add mean ac50 column to bioactivity table
+mc5.neuro.pfas4[, mean.ac50 := mean(modl_ga, na.rm=TRUE), by=casn]
+dat$mean.ac50 <- mc5.neuro.pfas4$mean.ac50[match(dat$casn, mc5.neuro.pfas4$casn)]
+```
+
+## Code for # C/ C chain length
+
+```{r results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+#-----------------------------------------------------------------------------------#
+# Compute number of carbon and fluorine atoms
+#-----------------------------------------------------------------------------------#
+
+# Add spaces between elements of molecular formula
+dat$molform <- opera.tb$MOLECULAR_FORMULA[match(dat$casn,opera.tb$CASRN)]
+dat[, molform2 := gsub("([A-Z])", " \\1", dat$molform)]
+
+library(tidyr)
+dat <- dat %>% separate(molform2, c("col1","col2","col3","col4","col5","col6"))
+dat <- dat[, c.atoms := "NA"]
+dat[grep("C",col2), c.atoms := col2]
+dat <- dat[, f.atoms := "NA"]
+dat[grep("F",col3), f.atoms := paste(col3)]
+dat[grep("F",col4), f.atoms := paste(col4)]
+dat[grep("F",col5), f.atoms := paste(col5)]
+
+dat[, c.atoms2 := gsub("([A-Z])", "\\1 ", c.atoms)]
+dat[, f.atoms2 := gsub("([A-Z])", "\\1 ", f.atoms)]
+
+dat <- dat %>% separate(c.atoms2, c("num1","num2"))
+setnames(dat,"num2","C.atoms")
+dat[, C.atoms := as.numeric(C.atoms)]
+dat <- dat %>% separate(f.atoms2, c("num1","num2"))
+setnames(dat,"num2","F.atoms")
+dat[, F.atoms := as.numeric(F.atoms)]
+dat <- dat[, C_F_ratio := C.atoms/F.atoms]
+
+#-----------------------------------------------------------------------------------#
+# Add carbon chain length information
+#-----------------------------------------------------------------------------------#
+
+# C chain length from Grace Patlewicz file
+c.chain <- setDT(read.xlsx('input/PFAS_c_chain_from_grace_25JULY22.xlsx'))
+
+intersect(dat$dsstox_substance_id, c.chain$DTXSID)
+omit.dtxsid <- setdiff(dat$dsstox_substance_id, c.chain$DTXSID) 
+#write.csv(omit.dtxsid,'output/C_chain_manualy_determine.csv')
+manual.c.chain <- as.data.table(read.xlsx('input/Manual_determine_C_chain_length_chemotyper.xlsx')) #loaded c_chain_length file with dtxsid and dtxcid into chemotyper and used ann's c chain length guide to manually inter C chain into file.
+c.chain.tbl <- unique(tbl.tested[,c('casn','dsstox_substance_id','perc.active','P.F')])
+c.chain.tbl$C.chain <- c.chain$`Final-max.Chain.length.-.new`[match(c.chain.tbl$dsstox_substance_id,c.chain$DTXSID)]
+c.chain.tbl[dsstox_substance_id %in% manual.c.chain$DTXSID, C.chain := manual.c.chain$c.chain]
+c.chain.tbl$C.total <- dat$C.atoms[match(c.chain.tbl$dsstox_substance_id,dat$dsstox_substance_id)]
+c.chain.tbl$mol_form <- dat$molform [match(c.chain.tbl$dsstox_substance_id,dat$dsstox_substance_id)]
+c.chain.tbl[, C.num.diff := ifelse(C.chain != C.total,"Diff","Same")]
+
+dat$C.chain <- c.chain.tbl$C.chain[match(dat$dsstox_substance_id,c.chain.tbl$dsstox_substance_id)]
+
+```
+
+## Supplemental Figure 3: QC and Physicochemical properties
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Create long format table for plot
+#-----------------------------------------------------------------------------------#
+
+dat.long <- melt(dat, id.vars = c("casn","sc.mc","is.active", "perc.active","auc.sum.log2",'mean.ac50',
+                                  #"volatility_flag",
+                                  "QC_fail"),
+                 measure.vars= c("MW","C.atoms","F.atoms","C_F_ratio",'logP','BP','log10.VP','C.chain'))
+
+dat.long <- as.data.table(dat.long)
+
+dat.long[, sd := sd(value, na.rm=TRUE), by=variable]
+dat.long[, mean := mean(value, na.rm=TRUE), by=variable]
+dat.long2 <- dat.long[variable %in% c('MW','logP','BP','log10.VP')]
+dat.long2[QC_fail %in% 1, QC := "Fail"]
+dat.long2[QC_fail %in% 0, QC := "Pass"]
+
+# Add stats to plots
+t <- t.test(dat.long2[variable %in% "logP",value] ~dat.long2[variable %in% "logP", QC_fail])
+t.pval.logP <- signif(t$p.value, digits=3)
+t <- t.test(dat.long2[variable %in% "BP",value] ~dat.long2[variable %in% "BP", QC_fail])
+t.pval.BP <- signif(t$p.value, digits=3)
+t <- t.test(dat.long2[variable %in% "MW",value] ~dat.long2[variable %in% "MW", QC_fail])
+t.pval.mw.qc <- signif(t$p.value, digits=3)
+t <- t.test(dat.long2[variable %in% "log10.VP",value] ~dat.long2[variable %in% "log10.VP", QC_fail])
+t.pval.log10.VP <- signif(t$p.value, digits=3)
+
+dat.long2[variable %in% "logP", pval2 := t.pval.logP]
+dat.long2[variable %in% "BP", pval2 := t.pval.BP]
+dat.long2[variable %in% "MW", pval2 := t.pval.mw.qc]
+dat.long2[variable %in% "log10.VP", pval2 := t.pval.log10.VP]
+
+dat.long2[, y.pos := (max(value,na.rm=TRUE)*0.9), by=variable]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(data=dat.long2,
+       aes(x=factor(QC), y=value, ymin = mean-sd, ymax = mean+sd))+
+    stat_summary(
+        fun = mean, 
+        geom = "errorbar", 
+        aes(ymax = ..y.., ymin = ..y..), 
+        position = position_dodge(width = 0.3), 
+        width = 0.8)+
+  scale_fill_manual(values=c("#B3CDE3", "#FBB4AE"))+
+  geom_jitter(aes(shape=as.factor(is.active)), width=0.13, height=0.18)+
+  scale_shape_manual(values=c(16,4))+
+  geom_text(data= dat.long2,
+            mapping = aes(x = 1.5, y = y.pos, label = paste("P-value:\n",pval2)),
+            check_overlap=TRUE)+
+  theme_bw()+
+  ylab(paste0(dat.long$variable))+
+  xlab("")+
+  guides(shape=guide_legend(title="DNT activity"))+
+  ylab("")+
+  ggtitle("") +
+  theme(text = element_text(size = 16)) +
+  facet_wrap(~variable, scales="free_y") +
+  theme(strip.text.x = element_text(size = 15))
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_QC_physico_chem_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 8, 
+    height = 8, #change from 8 to 20
+    units = "in",
+    res = 600)
+p
+dev.off()
+
+```
+
+## Figure 3A: Physicochemical properties vs Activity
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Create long format table
+#-----------------------------------------------------------------------------------#
+dat.long2 <- dat.long[variable %in% c('C_F_ratio','C.chain','logP'), ]
+
+#calc pvals for each condition
+t <- t.test(dat.long2[variable %in% "C_F_ratio",value] ~dat.long2[variable %in% "C_F_ratio", is.active])
+t.pval.C_F_ratio <- signif(t$p.value,digits=2)
+t <- t.test(dat.long2[variable %in% "C.chain",value] ~dat.long2[variable %in% "C.chain", is.active])
+t.pval.c.chain <- signif(t$p.value,digits=2)
+t <- t.test(dat.long2[variable %in% "logP",value] ~dat.long2[variable %in% "logP", is.active])
+t.pval.logP <- signif(t$p.value,digits=2)
+
+dat.long2 <- dat.long2[, pval := 1000]
+dat.long2[variable %in% "C_F_ratio", pval := t.pval.C_F_ratio]
+dat.long2[variable %in% "C.chain", pval := t.pval.c.chain]
+dat.long2[variable %in% "logP", pval := t.pval.logP]
+
+dat.long2[, y.pos := (max(value,na.rm=TRUE)*0.94), by=variable]
+order1 <- c("Inactive","Active")
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(data=dat.long2,
+       aes(x=factor(is.active), y=value, ymin = mean-sd, ymax = mean+sd, fill=is.active))+
+  geom_boxplot(width=0.55, outlier.shape=NA)+
+  scale_fill_manual(values=c("#B3CDE3", "#FBB4AE"))+
+  geom_jitter(aes(color=as.factor(QC_fail),shape=as.factor(sc.mc)), width=0.13, height=0.18)+
+  scale_color_manual(values=c("black","red"))+
+  scale_shape_manual(values=c(1,2))+
+  scale_x_discrete(limits = order1)+
+  geom_text(data= dat.long2,
+            mapping = aes(x = 1.5, y = y.pos, label = paste("P-value:",pval)),
+            check_overlap=TRUE, size=4.5)+
+  theme_bw()+
+  ylab(paste0(dat.long2$variable))+
+  xlab("")+
+  ylab("")+
+  ggtitle("") +
+  theme(axis.text = element_text(size=14))+
+  facet_wrap(~variable, scales="free_y", labeller = labeller(variable = 
+    c("C_F_ratio" = "C:F Ratio",
+      "logP"="logP",
+      "C.chain" = "CF chain length"))) +
+  theme(strip.text.x = element_text(size = 15))+
+   theme(legend.position="top")
+
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_structure_bioactivity_sc_mc_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 8, 
+    height = 4, #change from 8 to 20
+    units = "in",
+    res = 600)
+p
+dev.off()
+
+```
+
+## Supplemental Figure 9: Physiochem vs AC50 Regression Plots
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+#-----------------------------------------------------------------------------------#
+# Create long format table for plot
+#-----------------------------------------------------------------------------------#
+
+dat.long2 <- dat.long[variable %in% c('C_F_ratio','C.chain','MW','logP','BP','log10.VP') 
+                      & sc.mc %in% "mc", ]
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggscatter(
+  dat.long2[!is.na(mean.ac50),], y = "mean.ac50", x = "value",
+  #color = variable, palette = "blues",
+  add = "reg.line"
+  ) +
+  facet_wrap(~variable, scales="free_x", ncol=3,labeller = labeller(variable = 
+    c("C_F_ratio" = "C:F Ratio",
+      "logP"="logP",
+      "C.chain" = "CF chain length",
+      "MW"="MW",
+      "BP"="BP",
+      "log10.VP"="VP (log10)"))) +
+  theme(strip.text.x = element_text(size = 15))+
+  stat_cor(label.y = 2.9) +
+  stat_regline_equation(label.y = 2.3)+
+  labs(title="", 
+         x="", y = expression(paste("Mean AC50 (log10 ",mu,"M)")))+
+  ylim(c(-2,3))
+
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_physico_chem_AC50_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 11, 
+    height = 7, #change from 8 to 20
+    units = "in",
+    res = 600)
+p
+dev.off()
+```
+
+## Figure 3C: OECD categories and perc active
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+#-----------------------------------------------------------------------------------#
+# Create long format table for plot
+#-----------------------------------------------------------------------------------#
+
+dat.long$cat <- oecd.class$value[match(dat.long$casn,oecd.class$casrn)]
+
+dat.long.sum <- unique(dat.long[, c('casn', 'perc.active','cat', 'QC_fail','sc.mc','is.active')])
+dat.long.sum$is.active <- factor(dat.long.sum$is.active,levels=c("Inactive","Active"))
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(dat.long.sum, aes(x=reorder(cat, perc.active), y=perc.active, fill=is.active))+
+  geom_boxplot(width=0.55, outlier.shape=NA)+
+  geom_point(position=position_jitterdodge(),
+             aes(color=as.factor(dat.long.sum$QC_fail), group=is.active,
+                  shape=as.factor(sc.mc)))+
+  scale_color_manual(values=c("black","red"))+
+  scale_fill_manual(values=c( "#FBB4AE", "#B3CDE3"))+
+  scale_shape_manual(values=c(1,2))+
+  theme_minimal()+
+  theme(legend.position="none")+
+  labs(title="", 
+         x="", y = "Percent active")+
+  theme(text = element_text(size = 11)) +
+  theme(panel.border = element_rect(color = "gray",
+                                    fill = NA,
+                                    size = 1))+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 16))+
+  theme(axis.text.x = element_text(angle = 30, hjust=0.9),
+        axis.ticks.x=element_line())
+
+p
+
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/fig_OECD_structure_perc_active_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path,
+    width = 4,
+    height = 3, #change from 8 to 20
+    units = "in",
+    res = 300)
+p
+dev.off()
+```
+
+
+## Figure 3B: Bin C chain length, 3 bins and percent activity
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+#-----------------------------------------------------------------------------------#
+# Long format table for plot
+#-----------------------------------------------------------------------------------#
+dat.long2 <- dat.long[variable %in% "C.chain",]
+dat.long2[value %in% 1:3, C.bin := '<4 C']
+dat.long2[value %in% 4:7, C.bin := '4:7  C']
+dat.long2[value %in% 8:14, C.bin := "\u2265 8 C"]
+
+dat.long2$QC_fail <- as.factor(dat.long2$QC_fail)
+dat.long2$is.active <- factor(dat.long2$is.active, levels = c("Inactive","Active"))
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+
+p <- ggplot(dat.long2, aes(x=reorder(C.bin,value), y=perc.active, fill=is.active))+
+  geom_boxplot(outlier.shape=NA)+
+  geom_point(position=position_jitterdodge(),
+             aes(color=dat.long2$QC_fail, group=is.active,
+                 shape=sc.mc))+
+             #shape=dat.long2$QC_fail) +
+  scale_shape_manual(values=c(1,2))+
+  scale_fill_manual(values=c( "#FBB4AE", "#B3CDE3"))+
+  #geom_jitter(aes(col=QC_fail), width=0.13, height=0.18)+
+              #aes(color=as.factor(volatility_flag)))+
+  scale_color_manual(values=c("black","red"))+
+  #scale_fill_brewer(palette="Pastel1")+
+  theme_minimal()+
+  #ylim(0,40)+
+  #theme(legend.position="none")+
+  labs(title="", 
+         x="CF chain length", y = "Percent active")+
+  theme(text = element_text(size = 12)) +
+  theme(panel.border = element_rect(color = "gray",
+                                    fill = NA,
+                                    size = 1))+
+  theme(legend.position="none")
+p
+
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/fig_C_chain_3groups_perc_active2_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path,
+    width = 3,
+    height = 3, #change from 8 to 20
+    units = "in",
+    res = 300)
+p
+dev.off()
+```
+
+# 8. Toxprint Enrichment analysis
+
+## Toxprint Enrichment analysis TxP 34 (with QC fails)
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Load PFAS-specific ToxPrints
+#-----------------------------------------------------------------------------------#
+txp.long <- setDT(read.csv('input/EPAPFASINV_34TxP_Cat_assignments_20200413.csv'))
+
+# Make string of ToxPrints per PFAS
+txp34.for.supp <- txp.long[DTXSID %in% tbl.tested$dsstox_substance_id,]
+txp34.for.supp[, txp.list := paste(Txp_cats, collapse=";"), by=DTXSID]
+txp34.for.supp <- unique(txp34.for.supp[,c('DTXSID','txp.list')])
+
+#-----------------------------------------------------------------------------------#
+# Make table for enrichment analysis
+#-----------------------------------------------------------------------------------#
+txp.long2 <- txp.long[DTXSID %in% tbl.tested$dsstox_substance_id,]
+txp.long2$value <- 1
+txp <- as.data.table(dcast(txp.long2,
+                    DTXSID ~ Txp_cats, value.var="value"))
+
+names(txp)
+txp[, c(2:34) := lapply (.SD, as.numeric), .SDcols = c(2:34)] # ensure numeric
+txp <- txp %>% distinct(DTXSID, .keep_all = TRUE) 
+
+txp.matrix <- txp[,2:34]
+txp.matrix <- sapply(txp.matrix, as.numeric)
+rownames(txp.matrix) <- txp$DTXSID
+txp.matrix[is.na(txp.matrix)] <- 0
+txp.matrix.cc <- na.omit(txp.matrix)
+
+# filter out toxprints that have no chemicals with that feature
+txp.matrix.cc1 <- txp.matrix.cc[,colSums(txp.matrix.cc)>=3]
+#filter out toxprints in every chemical
+nrow1 <- nrow(txp.matrix.cc1)
+txp.matrix.cc1 <- txp.matrix.cc1[,colSums(txp.matrix.cc1)<nrow1]
+
+# Add DNT hitcall data--------------------------------------------------------------
+txp.df <- as.data.table(txp.matrix.cc1, keep.rownames = TRUE)
+txp.df$is.active <- tbl.tested$is.active[match(txp.df$rn, tbl.tested$dsstox_substance_id)]
+names(txp.df)
+txp.df2 <- as.data.frame(txp.df[,2:31])
+rownames(txp.df2) <- txp.df$rn
+txp.df2$is.active
+
+#-----------------------------------------------------------------------------------#
+# Fisher's Exact Rest
+#-----------------------------------------------------------------------------------#
+colnames(txp.df2)
+# for loop that calculates fisher's test, outputs p value, estimate a confidence interval
+dataft <- matrix(NA, ncol = 4, nrow = 29) # create empty matrix (nrow= number of toxprints)
+
+for (i in 1:29){ # column location for the txp's
+  tf <- table(txp.df2[,i], txp.df2$is.active)
+  tf2 <- data.frame(rbind(tf))
+  print(i)
+  print(tf2)
+  fttf <- fisher.test(tf2)
+  #try(fttf <- fisher.test(tf2), silent=TRUE)
+  dataft[i,] <-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+# construct a data.frame to interpret
+colnames(dataft) <- c('Pval','Odds_ratio','Lower','Upper')
+dataft <- data.frame(dataft)
+dataft$Padj <- p.adjust(dataft$Pval, method='fdr')
+dataft$feature <- colnames(txp.df2[,1:29])
+txp34.sig.all <- dataft[order(dataft$Pval),]
+#write.xlsx(dataft, 'output/Supp_tbl5_txp34_signif_all.xlsx')
+
+#filtering significant results
+sigdataft <- filter(dataft, Pval <.05)
+sigdataft <- filter(sigdataft, !is.na(Odds_ratio)) %>% as.data.table()
+
+```
+
+## Toxprint Enrichment analysis TxP 34 (without QC fails)
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Make table for enrichment analysis
+#-----------------------------------------------------------------------------------#
+txp <- as.data.table(dcast(txp.long2,
+                    DTXSID ~ Txp_cats, value.var="value"))
+
+names(txp)
+txp[, c(2:34) := lapply (.SD, as.numeric), .SDcols = c(2:34)] # ensure numeric
+txp <- txp %>% distinct(DTXSID, .keep_all = TRUE) 
+
+# remove PFAS that failed QC
+QC.fail.dtxsid <- tbl.tested[QC_fail==1,dsstox_substance_id]
+txp <- txp[!DTXSID %in% QC.fail.dtxsid,]
+names(txp)
+txp.matrix <- txp[,2:34]
+txp.matrix <- sapply(txp.matrix, as.numeric)
+rownames(txp.matrix) <- txp$DTXSID
+txp.matrix[is.na(txp.matrix)] <- 0
+txp.matrix.cc <- na.omit(txp.matrix)
+rownames(txp.matrix.cc)
+
+# filter out toxprints that have no chemicals with that feature
+txp.matrix.cc1 <- txp.matrix.cc[,colSums(txp.matrix.cc)>=3]
+# filter out toxprints in every chemical
+nrow1 <- nrow(txp.matrix.cc1)
+txp.matrix.cc1 <- txp.matrix.cc1[,colSums(txp.matrix.cc1)<nrow1]
+
+# add DNT hitcall data---------------------------------------------------------------
+txp.df <- as.data.table(txp.matrix.cc1, keep.rownames = TRUE)
+txp.df$is.active <- tbl.tested$is.active[match(txp.df$rn, tbl.tested$dsstox_substance_id)]
+names(txp.df)
+txp.df2 <- as.data.frame(txp.df[,2:21])
+rownames(txp.df2) <- txp.df$rn
+
+#-----------------------------------------------------------------------------------#
+# Fisher's Exact Rest
+#-----------------------------------------------------------------------------------#
+colnames(txp.df2)
+# for loop that calculates fisher's test, outputs p value, estimate a confidence interval
+dataft <- matrix(NA, ncol = 4, nrow = 19) # create empty matrix (nrow= number of toxprints)
+
+for (i in 1:19){ # column location for the txp's
+  tf <- table(txp.df2[,i], txp.df2$is.active)
+  tf2 <- data.frame(rbind(tf))
+  print(i)
+  print(tf2)
+  fttf <- fisher.test(tf2)
+  #try(fttf <- fisher.test(tf2), silent=TRUE)
+  dataft[i,] <-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+# construct a data.frame to interpret
+colnames(dataft) <- c('Pval','Odds_ratio','Lower','Upper')
+dataft <- data.frame(dataft)
+dataft$Padj <- p.adjust(dataft$Pval, method='fdr')
+dataft$feature <- colnames(txp.df2[,1:19])
+txp34.sig.no.fail <- dataft[order(dataft$Pval),]
+#write.xlsx(dataft, 'output/Supp_tbl5_txp34_signif_all.xlsx')
+
+#filtering significant results
+sigdataft <- filter(dataft, Pval <.05)
+sigdataft <- filter(sigdataft, !is.na(Odds_ratio)) %>% as.data.table()
+
+```
+
+## Figure 3C: Percent activity and Txp 34
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Create table for plot
+#-----------------------------------------------------------------------------------#
+txp.long2 <- txp.long[DTXSID %in% all.chems$dsstox_substance_id,]
+
+txp.long2[, Txp_cats2 := sapply(strsplit(txp.long2$Txp_cats,"TxP_"),'[', 2)]
+
+
+txp.long3 <- merge(txp.long2, tbl.tested[,c('perc.active', "QC_fail","is.active","sc.mc",'dsstox_substance_id')],by.x='DTXSID', by.y='dsstox_substance_id')
+head(txp.long3)
+
+txp.long.active <- txp.long3[is.active %in% "Active",]
+txp.long.active[, mean.perc.active := mean(perc.active, na.rm=TRUE), by=Txp_cats]
+
+txp.long3$mean.perc.active <- txp.long.active$mean.perc.active[match(txp.long3$Txp_cats,txp.long.active$Txp_cats)]
+txp.long3[is.na(mean.perc.active), mean.perc.active := 0]
+str(txp.long3)
+txp.long3$Txp_cats <- as.factor(txp.long3$Txp_cats2)
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+p <- ggplot(txp.long3, aes(x=reorder(Txp_cats2, -mean.perc.active), y=perc.active, fill=is.active))+
+  geom_boxplot(outlier.shape=NA)+
+  geom_point(position=position_jitterdodge(jitter.width=0.8,
+                                           jitter.height=0.8),
+             aes(color=as.factor(txp.long3$QC_fail),
+                 group=is.active,
+                 shape=sc.mc))+
+  scale_shape_manual(values=c(1,2))+
+  scale_fill_manual(values=c( "#B3CDE3","#FBB4AE"))+
+  theme_minimal()+
+  scale_color_manual(values=c("black","red"))+
+  theme_minimal()+
+  theme(legend.position="none")+
+  labs(title="", 
+         x="", y = "Percent active")+
+  theme(text = element_text(size = 12)) +
+  theme(panel.border = element_rect(color = "gray",
+                                    fill = NA,
+                                    size = 1))+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 16))+
+  theme(axis.text.x = element_text(angle = 35, hjust=1),
+        axis.ticks.x=element_line())+
+  theme(legend.position="none")+
+      theme(plot.margin = unit(c(0,0,0,1), "cm"))
+
+p
+
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/fig_Txp34_perc_active_sort_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path,
+    width = 9,
+    height = 4, #change from 8 to 20
+    units = "in",
+    res = 300)
+p
+dev.off()
+
+# Stats for results section
+names(txp.long3)
+unique(txp.long3$Txp_cats)
+txp.long3[Txp_cats %in% 'PFAS_COOH' & is.active %in% "Active", median(perc.active, na.rm=TRUE)]
+txp.long3[Txp_cats %in% 'PFAS_sulfonamide' & is.active %in% "Active", median(perc.active, na.rm=TRUE)]
+
+```
+
+## Toxprint Enrichment analysis 729 (with QC fails)
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#-----------------------------------------------------------------------------------#
+# Download 729 public ToxPrints (not PFAS-specific)
+#-----------------------------------------------------------------------------------#
+# download fingerprints from the dashboard
+txp729 <- setDT(read.csv('input/CCD-Batch-Search_2022-06-28_03_15_57_fingerprints729.csv'))
+
+names(txp729)
+txp729[, c(5:733) := lapply (.SD, as.numeric), .SDcols = c(5:733)] # ensure numeric
+txp729 <- txp729 %>% distinct(DTXSID, .keep_all = TRUE) 
+
+txp.matrix <- txp729[,5:733]
+txp.matrix <- sapply(txp.matrix, as.numeric)
+rownames(txp.matrix) <- txp729$DTXSID
+txp.matrix.cc <- na.omit(txp.matrix)
+rownames(txp.matrix.cc)
+# filter out toxprints that have no chemicals with that feature
+txp.matrix.cc1 <- txp.matrix.cc[,colSums(txp.matrix.cc)>=3]
+# filter out toxprints in every chemical
+nrow1 <- nrow(txp.matrix.cc1)
+txp.matrix.cc1 <- txp.matrix.cc1[,colSums(txp.matrix.cc1)<nrow1]
+rownames(txp.matrix.cc1)
+
+# add DNT hitcall data--------------------------------------------------------------
+txp.df <- as.data.table(txp.matrix.cc1, keep.rownames = TRUE)
+names(txp.df)
+#tbl.tested[, is.active2 := ifelse(is.active %in% "Active", 1,0)]
+txp.df$is.active <- tbl.tested$is.active[match(txp.df$rn, tbl.tested$dsstox_substance_id)]
+names(txp.df)
+txp.df2 <- as.data.frame(txp.df[,2:76])
+rownames(txp.df2) <- txp.df$rn
+#enrichment analysis (active vs not active)
+colnames(txp.df2)
+# for loop that calculates fisher's test, outputs p value, estimate a confidence interval
+dataft <- matrix(NA, ncol = 4, nrow = 74) # create empty matrix (nrow= number of toxprints)
+
+for (i in 1:74){ # column location for the txp's
+  tf <- table(txp.df2[,i], txp.df2$is.active)
+  tf2 <- data.frame(rbind(tf))
+  print(i)
+  print(tf2)
+  fttf <- fisher.test(tf2)
+  #try(fttf <- fisher.test(tf2), silent=TRUE)
+  dataft[i,] <-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+# construct a data.frame to interpret
+colnames(dataft) <- c('Pval','Odds_ratio','Lower','Upper')
+dataft <- data.frame(dataft)
+dataft$Padj <- p.adjust(dataft$Pval, method='fdr')
+dataft$feature <- colnames(txp.df2[,1:74])
+txp729.sig <- dataft[order(dataft$Pval),]
+#write.xlsx(txp729.sig, 'output/Supp_tbl5_txp729_signif_all.xlsx')
+
+#filtering significant results
+sigdataft <- filter(dataft, Pval <.05)
+sigdataft <- filter(sigdataft, !is.na(Odds_ratio)) %>% as.data.table()
+
+```
+
+## Toxprint Enrichment analysis 729 (without QC fails)
+```{r  warning=FALSE, message=FALSE, fig.height=4, fig.width=4}
+
+#download SDF file from chem reg: https://ccte-chemreg.epa.gov/ChemReg/export.jsf
+#download fingerprints from the dashboard
+txp729 <- setDT(read.csv('input/CCD-Batch-Search_2022-06-28_03_15_57_fingerprints729.csv'))
+
+#remove PFAS that failed QC
+QC.fail.dtxsid <- tbl.tested[QC_fail==1,dsstox_substance_id]
+txp729 <- txp729[!DTXSID %in% QC.fail.dtxsid,]
+
+txp729[, c(5:733) := lapply (.SD, as.numeric), .SDcols = c(5:733)] # ensure numeric
+txp729 <- txp729 %>% distinct(DTXSID, .keep_all = TRUE) 
+
+txp.matrix <- txp729[,5:733]
+txp.matrix <- sapply(txp.matrix, as.numeric)
+rownames(txp.matrix) <- txp729$DTXSID
+txp.matrix.cc <- na.omit(txp.matrix)
+rownames(txp.matrix.cc)
+# filter out toxprints that have no chemicals with that feature
+txp.matrix.cc1 <- txp.matrix.cc[,colSums(txp.matrix.cc)>=3]
+#filter out toxprints in every chemical
+nrow1 <- nrow(txp.matrix.cc1)
+txp.matrix.cc1 <- txp.matrix.cc1[,colSums(txp.matrix.cc1)<nrow1]
+rownames(txp.matrix.cc1)
+
+# add DNT hitcall data----------------------------------
+#dnt hitcall data 
+txp.df <- as.data.table(txp.matrix.cc1, keep.rownames = TRUE)
+names(txp.df)
+#tbl.tested[, is.active2 := ifelse(is.active %in% "Active", 1,0)]
+txp.df$is.active <- tbl.tested$is.active[match(txp.df$rn, tbl.tested$dsstox_substance_id)]
+names(txp.df)
+txp.df2 <- as.data.frame(txp.df[,2:56])
+rownames(txp.df2) <- txp.df$rn
+#enrichment analysis (active vs not active)
+colnames(txp.df2)
+# for loop that calculates fisher's test, outputs p value, estimate a confidence interval
+dataft <- matrix(NA, ncol = 4, nrow = 54) # create empty matrix (nrow= number of toxprints)
+
+for (i in 1:54){ # column location for the txp's
+  tf <- table(txp.df2[,i], txp.df2$is.active)
+  tf2 <- data.frame(rbind(tf))
+  print(i)
+  print(tf2)
+  fttf <- fisher.test(tf2)
+  #try(fttf <- fisher.test(tf2), silent=TRUE)
+  dataft[i,] <-c(fttf$p.value, fttf$estimate, fttf$conf.int)
+}
+
+# construct a data.frame to interpret
+colnames(dataft) <- c('Pval','Odds_ratio','Lower','Upper')
+dataft <- data.frame(dataft)
+dataft$Padj <- p.adjust(dataft$Pval, method='fdr')
+dataft$feature <- colnames(txp.df2[,1:54])
+txp729.sig.no.fail <- dataft[order(dataft$Pval),]
+#write.xlsx(txp729.sig.no.fail, 'output/Supp_tbl5_txp729_signif_no_fail.xlsx')
+
+#filtering significant results
+sigdataft <- filter(dataft, Pval <.05)
+sigdataft <- filter(sigdataft, !is.na(Odds_ratio)) %>% as.data.table()
+
+```
+
+
+# 9. Selectivity Heatmaps
+
+## Figure 2: MEA NFA
+```{r Matrix for AUC MEA heatmap, results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Create table for plot
+#-----------------------------------------------------------------------------------#
+
+mat.all<- dcast.data.table(mc5.mea.dev,
+                                casn + dsstox_substance_id  ~ aenm,
+                                value.var = c('auc')
+)
+
+# replace NA's with 0
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),0,x)}), .SDcol=c(3:21)]
+matrix <- as.matrix(mat.all2)
+
+# add asterisks for DTXSID's that were determined to be equivocal
+equiv.dtxsid <- tbl.tested[is.active3 %in% "Equivocal",dsstox_substance_id]
+mat.all[, dsstox_substance_id2 := paste(dsstox_substance_id)]
+mat.all[dsstox_substance_id %in% equiv.dtxsid, dsstox_substance_id2 := paste0(dsstox_substance_id,"*")]
+
+# Replace CASRN for positive control and short name
+unique(mc5.neuro[chnm %in% "Tributyltin methacrylate",casn])
+mat.all <- mat.all[casn %in% "2155-70-6", dsstox_substance_id2 := "Tributyltin"]
+mat.all <- mat.all[casn %in% "335-67-1", dsstox_substance_id2 := "PFOA*"]
+rownames(matrix) <- mat.all[,dsstox_substance_id2]
+
+# change the color of the rownames red for QC fails
+fail.qc <- tbl.tested[QC_fail==1,dsstox_substance_id]
+# initiate cols with all black
+cols <- rep('black', nrow(matrix))
+# turn red the specified rows in tf
+cols[row.names(matrix) %in% fail.qc] <- 'red'
+
+#-----------------------------------------------------------------------------------#
+# Legends for heatmap
+#-----------------------------------------------------------------------------------#
+# create 'activity type'  heatmap legend
+activity.tbl <- as.data.table(colnames(matrix))
+setnames(activity.tbl, c("V1"), c("aenm"))
+activity.tbl$number <- activity.tbl.colors$number5[match(activity.tbl$aenm, activity.tbl.colors$aenm)]
+activity.tbl$activity <- activity.tbl.colors$activity5[match(activity.tbl$aenm,activity.tbl.colors$aenm)]
+
+# create QC heatmap legend 
+dat.long2 <- dat.long[variable %in% "C.chain",]
+dat.long2[value %in% 1:3, C.bin := '1:3 C']
+dat.long2[value %in% 4:7, C.bin := '4:7 C']
+dat.long2[value %in% 8:14, C.bin := '\u2265 8 C']
+
+mat.all$C.bin <- dat.long2$C.bin[match(mat.all$casn,dat.long2$casn)]
+
+# set legend colors
+mat.all[C.bin %in% '1:3 C', color := "gray90"]
+mat.all[C.bin %in% '4:7 C', color := "gray77"]
+mat.all[C.bin %in% '\u2265 8 C', color := "gray55"]
+
+#-----------------------------------------------------------------------------------#
+# Heatmap
+#-----------------------------------------------------------------------------------#
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_NFA_AUC_heatmap_C_chain_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 8.5, 
+    height = 7.5, #change from 8 to 20
+    units = "in",
+    res = 600)
+heatmap.2(matrix, scale='none', 
+          col=viridis(50, option='A', direction=-1),
+          #col=mako(50,  direction=-1),
+          #col=viridis(50, option='A', direction=-1, alpha=0.9),
+          #col=brewer.pal(11,"RdBu"),
+          symbreaks=F,
+          symm=F,
+          symkey=F,
+          breaks=seq(0,375, length.out=51),
+          trace='none', density.info = 'none',
+          colsep = c(1:91), sepcolor='white', sepwidth=c(0.05,0.05),
+          #rowsep = c(1:5), 
+          hclustfun = function(x) hclust(x, method="ward.D2"),
+          labRow = row.names(matrix),
+          labCol=substr(colnames(matrix),21,91),
+          #labCol = NA,
+          margins = c(15,20),
+          cexRow =1,
+          cexCol=0.8,
+          colRow=cols,
+          ColSideColors = as.character(activity.tbl$number),
+          RowSideColors = mat.all$color,
+          srtCol=35,
+          #adjCol=c(0.5,0.5),
+          keysize=0.9)
+
+legend(
+  xpd=TRUE, x=0.75, y=1.15,
+  title='Activity Type',
+  legend = unique(activity.tbl$activity),
+  col = unique(as.character(activity.tbl$number)), 
+  bty='n',
+  lty= 1,             
+  lwd = 3,           
+  cex=0.7
+)
+legend(xpd=TRUE, x=0.75, y=0.98,
+       title='CF chain length',
+       legend = unique(as.factor(mat.all$C.bin)),
+       col = unique(mat.all$color), 
+       bty='n',
+       lty= 1,             
+       lwd = 4,           
+       cex=0.7,
+       y.intersp=0.9
+)
+dev.off()
+
+
+```
+
+
+## MEA NFA AUC stats
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+# Distance matrix
+d <- dist(matrix, method = "euclidean")
+# Ward's method
+hc5 <- hclust(d, method = "ward.D2" )
+
+# Cut tree into 4 groups
+sub_grp <- cutree(hc5, k = 4)
+dtxsid.rows <- as.data.table(matrix, keep.rownames = T)
+dtxsid.rows$cluster <- sub_grp
+dtxsid.rows[, row.mean.auc := rowMeans(.SD, na.rm=TRUE), .SDcols=c(2:20)]
+dtxsid.rows2 <- dtxsid.rows[,c('rn','cluster','row.mean.auc')]
+dtxsid.rows2[, .(mean(row.mean.auc),
+                 sd(row.mean.auc)),by=cluster]
+
+dtxsid.rows2[,is.pfas:= 1]
+dtxsid.rows2[rn %in% "Tributyltin",is.pfas:= 0]
+
+dtxsid.rows2[, .(mean(row.mean.auc),
+                 sd(row.mean.auc)),by=is.pfas]
+```
+
+
+## Supplemental Figure 7: HCI
+```{r Matrix for HCI AUC heatmap, results= "hide", warning=FALSE, message=FALSE}
+#-----------------------------------------------------------------------------------#
+# Matrix for heatmap
+#-----------------------------------------------------------------------------------#
+mc5.hci <- mc5.neuro.pfas4[grep("HCI_",aenm),]
+
+#add positive control
+hg.pos <- mc5.neuro[ chnm %in% "Tributyltin methacrylate", ]
+hg.pos <- hg.pos[aenm %in% mc5.hci$aenm,]
+hg.pos$modl_ga
+#cyto
+unique(hg.pos[,c('aenm','aeid')])
+#cyto hits
+apop.cyto <- hg.pos[aeid %in% 2794,modl_ga]
+prol.cyto <- hg.pos[aeid %in% 2796,modl_ga]
+nog.cyto <- hg.pos[aeid %in% 3070,modl_ga]
+
+hg.pos[aeid %in% c(2793:2794) & modl_ga > apop.cyto, modl_ga := NA]
+hg.pos[aeid %in% c(2796:2797) & modl_ga > prol.cyto, modl_ga := NA]
+hg.pos[aeid %in% c(3067:3070) & modl_ga > nog.cyto, modl_ga := NA]
+hg.pos$modl_ga
+hg.pos <- hg.pos[is.na(modl_ga),hitc := 0]
+hg.pos <- hg.pos[hitc==0,use.me := 0]
+
+#bind data
+mc5.hci <- rbind(mc5.hci, hg.pos, fill=TRUE)
+
+#------------------
+mc5.hci <- mc5.hci[,hitsum := sum(hitc),by=casn]
+mc5.hci[chnm %in% "Tributyltin methacrylate", modl_ga]
+mc5.hci[chnm %in% "Tributyltin methacrylate", aenm]
+mc5.hci <- mc5.hci[!hitsum==0,]
+
+#add auc column
+mc5.hci <- auc_function(mc5.hci)
+mc5.hci <- mc5.hci[is.na(modl_ga),auc:= NA]
+
+summary(mc5.hci$auc) 
+mc5.hci[is.na(modl_ga), auc := 0]
+
+#sum AUC for each chemical
+mc5.hci[,auc.sum.mea := sum(auc, na.rm=T), by= casn]
+mc5.hci <- mc5.hci[!auc.sum.mea==0,]
+
+#take the log2 of the sum
+mc5.hci[, log2.auc.mea.sum := ifelse(!is.na(auc.sum.mea), log2(auc.sum.mea), NA)]
+#find the 95th percentile
+mc5.hci[, log2.auc.mea.sum.95 := ifelse(!is.na(log2.auc.mea.sum), quantile(log2.auc.mea.sum, 0.95, na.rm=T), NA)]
+mea95 <- quantile(mc5.hci$log2.auc.mea.sum, 0.95, na.rm=TRUE)
+#make a scaled AUC by dividing the log2 by the quantile
+mc5.hci[,scaled.auc.mea := ifelse(!is.na(log2.auc.mea.sum), round(log2.auc.mea.sum/mea95, 2), NA)]
+mc5.hci[,scaled.auc.mea := ifelse(is.infinite(scaled.auc.mea), 0, scaled.auc.mea)]
+#make summary table
+mea.auc.sum <- unique(mc5.hci[,c('chnm','casn','auc','scaled.auc.mea')])
+#write.xlsx(mea.auc.cytoAC50, 'output/NFA_sel_AUC.xlsx', overwrite=T)
+
+#HCI matrix for heatmap
+mat.all<- dcast.data.table(mc5.hci,
+                                casn + dsstox_substance_id  ~ aenm,
+                                value.var = c('auc')
+)
+
+#replace NA's with 0
+names(mat.all)
+mat.all2 <- mat.all[,lapply(.SD, function(x){ifelse(is.na(x),0,x)}), .SDcol=c(3:10)]
+matrix <- as.matrix(mat.all2)
+
+#add asterix for DTXSID's that were determined to be equivocal
+equiv.dtxsid <- tbl.tested[is.active3 %in% "Equivocal",dsstox_substance_id]
+mat.all[, dsstox_substance_id2 := paste(dsstox_substance_id)]
+mat.all[dsstox_substance_id %in% equiv.dtxsid, dsstox_substance_id2 := paste0(dsstox_substance_id,"*")]
+
+#list methylmercruy instead of CASRN
+unique(mc5.neuro[chnm %in% "Tributyltin methacrylate",casn])
+mat.all <- mat.all[casn %in% "2155-70-6", dsstox_substance_id2 := "Tributyltin"]
+mat.all <- mat.all[casn %in% "335-67-1", dsstox_substance_id2 := "PFOA*"]
+
+rownames(matrix) <- mat.all[,dsstox_substance_id2]
+
+#change the color of the rownames red for QC fails
+fail.qc <- tbl.tested[QC_fail==1,dsstox_substance_id]
+#initiate cols with all black
+cols <- rep('black', nrow(matrix))
+#turn red the specified rows in tf
+cols[row.names(matrix) %in% fail.qc] <- 'red'
+
+
+#-----------------------------------------------------------------------------------#
+# Legends for heatmap
+#-----------------------------------------------------------------------------------#
+#create 'activity type'  heatmap legend
+activity.tbl <- as.data.table(colnames(matrix))
+setnames(activity.tbl, c("V1"), c("aenm"))
+activity.tbl$number <- activity.tbl.colors$number5[match(activity.tbl$aenm, activity.tbl.colors$aenm)]
+activity.tbl$activity <- activity.tbl.colors$activity5[match(activity.tbl$aenm,activity.tbl.colors$aenm)]
+
+#create QC heatmap legend 
+dat.long2 <- dat.long[variable %in% "C.chain",]
+dat.long2[value %in% 1:3, C.bin := '1:3 C']
+dat.long2[value %in% 4:7, C.bin := '4:7 C']
+dat.long2[value %in% 8:14, C.bin := '\u2265 8 C']
+
+mat.all$C.bin <- dat.long2$C.bin[match(mat.all$casn,dat.long2$casn)]
+
+#set legend colors
+mat.all[C.bin %in% '1:3 C', color := "gray90"]
+mat.all[C.bin %in% '4:7 C', color := "gray77"]
+mat.all[C.bin %in% '\u2265 8 C', color := "gray55"]
+
+#-----------------------------------------------------------------------------------#
+# Heatmap
+#-----------------------------------------------------------------------------------#
+#save to file
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_HCI_AUC_heatmap_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, 
+    width = 12, 
+    height = 8, #change from 8 to 20
+    units = "in",
+    res = 600)
+heatmap.2(matrix, scale='none', 
+          col=viridis(50, option='A', direction=-1),
+          symbreaks=F,
+          symm=F,
+          symkey=F,
+          breaks=seq(0,375, length.out=51),
+          trace='none', density.info = 'none',
+          colsep = c(1:91), sepcolor='white', sepwidth=c(0.05,0.05),
+          #rowsep = c(1:5), 
+          hclustfun = function(x) hclust(x, method="ward.D2"),
+          labRow = row.names(matrix),
+          labCol=substr(colnames(matrix),16,91),
+          #labCol = NA,
+          margins = c(20,20),
+          cexRow =2,
+          cexCol=1.6,
+          ColSideColors = as.character(activity.tbl$number),
+          RowSideColors = mat.all$color,
+          srtCol=35,
+          #adjCol=c(0.5,0.5),
+          keysize=0.9)
+
+legend(
+  xpd=TRUE, x=0.78, y=1.13,
+  title='Activity Type',
+  legend = unique(activity.tbl$activity),
+  col = unique(as.character(activity.tbl$number)), 
+  bty='n',
+  lty= 1,             
+  lwd = 3,           
+  cex=0.7
+)
+
+legend(xpd=TRUE, x=0.82, y=0.99,
+       title='CF chain length',
+       legend = unique(as.factor(mat.all$C.bin)),
+       col = unique(mat.all$color), 
+       bty='n',
+       lty= 1,             
+       lwd = 4,           
+       cex=0.7,
+       y.intersp=0.9
+)
+
+dev.off()
+
+```
+
+## HCI AUC stats
+```{r  results= "hide", warning=FALSE, message=FALSE}
+mat.all[, is.pfas := 1]
+mat.all[casn %in% "2155-70-6", is.pfas := 0]
+mat.all[, row.mean.auc := rowMeans(.SD, na.rm=TRUE), .SDcols=c(3:10)]
+mat.all[, .(mean(row.mean.auc),
+                 sd(row.mean.auc)),by=is.pfas]
+135.37/3.526
+
+```
+
+# 10. Generate Supplemental Tables
+
+## Supplemental Table 1
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Table of chemical information, including concentrations tested min/max, physicochemical properties, and QC
+#-----------------------------------------------------------------------------------#
+
+# Summary concentrations tested in mc-----------------------------------------------
+chem.sum <- unique(mc5.neuro[casn %in% tbl.tested$casn, c('casn','chnm','dsstox_substance_id','aenm','logc_min','logc_max')])
+
+# mc NFA
+chem.sum.nfa <- chem.sum[grep("MEA",aenm),]
+chem.sum.nfa[, logc_min1.nfa := min(logc_min, na.rm=TRUE), by=casn]
+chem.sum.nfa[, min_uM_nfa_mc := 10^logc_min1.nfa, by=casn]
+chem.sum.nfa[, logc_max1.nfa := max(logc_max, na.rm=TRUE), by=casn]
+chem.sum.nfa[, max_uM_nfa_mc := 10^logc_max1.nfa, by=casn]
+chem.sum.nfa <- unique(chem.sum.nfa[,c('casn','chnm','dsstox_substance_id','min_uM_nfa_mc','max_uM_nfa_mc')])
+
+# mc HCI
+chem.sum.hci <- chem.sum[grep("HCI",aenm),]
+chem.sum.hci[, logc_min1.hci := min(logc_min, na.rm=TRUE), by=casn]
+chem.sum.hci[, min_uM_hci_mc := 10^logc_min1.hci, by=casn]
+chem.sum.hci[, logc_max1.hci := max(logc_max, na.rm=TRUE), by=casn]
+chem.sum.hci[, max_uM_hci_mc := 10^logc_max1.hci, by=casn]
+chem.sum.hci <- unique(chem.sum.hci[,c('casn','chnm','dsstox_substance_id','min_uM_hci_mc','max_uM_hci_mc')])
+chem.sum2.mc <- merge(chem.sum.nfa,chem.sum.hci,
+                   by=c('casn','chnm','dsstox_substance_id'), all=TRUE)
+
+# Summary concentrations tested in sc------------------------------------------------
+# Load sc1 data
+sc1.pfas <- setDT(read.xlsx('input/sc1_pfas_dnt_invitrodb_060922.xlsx'))
+chem.sc.hci <- sc1.pfas[grep("HCI",aenm),]
+chem.sc.mea <- sc1.pfas[grep("MEA_dev",aenm),]
+
+# sc HCI
+names(chem.sc.hci)
+chem.sc.hci[, logc.max := max(logc), by=casn]
+chem.sc.hci[, uM_HCI_sc := 10^logc.max]
+chem.sum.sc.hci <- unique(chem.sc.hci[casn %in% tbl.tested$casn, c('casn','chnm','dsstox_substance_id','uM_HCI_sc')])
+
+# sc NFA
+chem.sc.mea[, logc.max := max(logc), by=casn]
+chem.sc.mea[, uM_NFA_sc := 10^logc.max]
+chem.sum.sc.mea <- unique(chem.sc.mea[casn %in% tbl.tested$casn, c('casn','chnm','dsstox_substance_id','uM_NFA_sc')])
+
+# Merge NFA/HCI/mc/sc ---------------------------------------------------------------
+chem.sum2.sc <- merge(chem.sum.sc.hci,chem.sum.sc.mea,
+                   by=c('casn','chnm','dsstox_substance_id'), all=TRUE)
+
+chem.sum3 <- merge(chem.sum2.mc,chem.sum2.sc,
+                   by=c('casn','chnm','dsstox_substance_id'), all=TRUE)
+
+chem.sum4 <- unique(chem.sum3[, c("casn","chnm","dsstox_substance_id", "min_uM_nfa_mc", "max_uM_nfa_mc","min_uM_hci_mc","max_uM_hci_mc","uM_HCI_sc","uM_NFA_sc")])
+
+chem.sum4 <- merge(chem.sum3, dat[,c('casn','molform','MW','BP','logP','log10.VP','P.F','QC.flags')], by=c('casn'), all.x=TRUE) # Supplemental Table 1
+
+```
+
+## Supplemental Table 2A
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Table of which endpoints each chemical was tested in (both mc and sc endpoints)
+#-----------------------------------------------------------------------------------#
+
+end.sum.mc <- unique(mc5.neuro.pfas4[,c('chnm','dsstox_substance_id', 'casn','aenm')])
+end.sum.mc[, tested := 1]
+end.sum.sc <- unique(sc2.neuro.pfas3[,c('chnm','dsstox_substance_id', 'casn','aenm')])
+end.sum.sc[, tested := 1]
+setnames(end.sum.sc,"aenm","aenm_sc")
+end.sum.sc[, aenm := paste0("sc_",aenm_sc)]
+end.sum.sc$aenm_sc <- NULL
+
+end.sum <- rbind(end.sum.mc, end.sum.sc)
+end.sum.wide <- dcast(end.sum,
+                    dsstox_substance_id + chnm ~ aenm, value.var="tested") # Supplemental Table 2A
+
+```
+
+## Supplemental Table 2B
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Create summary table of which assays were tested for each chemicals
+#-----------------------------------------------------------------------------------#
+
+test.tbl <- unique(rbind(sc2.neuro.pfas4[,c('dsstox_substance_id','casn','chnm')],mc5.neuro.pfas4[,c('dsstox_substance_id','casn','chnm')]))
+
+nfa.mc <- unique(mc5.neuro.pfas4[grep("MEA",aenm),casn])
+nfa.sc <- unique(sc2.neuro.pfas4[grep("MEA",aenm),casn])
+
+
+apop.mc <- unique(mc5.neuro.pfas4[assay %in% "Apoptosis, hNP1",casn])
+apop.sc <- unique(sc2.neuro.pfas4[assay %in% "Apoptosis, hNP1",casn])
+
+pro.mc <- unique(mc5.neuro.pfas4[assay %in% "Proliferation, hNP1",casn])
+pro.sc <- unique(sc2.neuro.pfas4[assay %in% "Proliferation, hNP1",casn])
+
+nog.mc <- unique(mc5.neuro.pfas4[assay %in% "NOG initiation, CDI",casn])
+nog.sc <- unique(sc2.neuro.pfas4[assay %in% "NOG initiation, CDI",casn])
+
+# create table
+test.tbl[, MEA_NFA_mc := ifelse(casn %in% c(nfa.mc),"Yes","No")]
+test.tbl[, Apoptosis_mc := ifelse(casn %in% c(apop.mc),"Yes","No")]
+test.tbl[, Proliferation_mc := ifelse(casn %in% c(pro.mc),"Yes","No")]
+test.tbl[, NOG_mc := ifelse(casn %in% c(nog.mc),"Yes","No")]
+
+test.tbl[, MEA_NFA_sc := ifelse(casn %in% c(nfa.sc),"Yes","No")]
+test.tbl[, Apoptosis_sc := ifelse(casn %in% c(apop.sc),"Yes","No")]
+test.tbl[, Proliferation_sc  := ifelse(casn %in% c(pro.sc),"Yes","No")]
+test.tbl[, NOG_sc := ifelse(casn %in% c(nog.sc),"Yes","No")]
+
+test.tbl$casn <- NULL #Supplemental table 2B
+
+#-----------------------------------------------------------------------------------#
+# Results for results section: bioactivity for chemicals screened in all four mc assays
+#-----------------------------------------------------------------------------------#
+
+# screened in all 4 mc assays and hitcall outcome
+tested4 <- test.tbl[MEA_NFA_mc %in% "Yes" &
+                      Apoptosis_mc %in% "Yes" &
+                      Proliferation_mc %in% "Yes" &
+                      NOG_mc %in% "Yes",]
+
+tested4.act <- hit.assay[dsstox_substance_id %in% tested4$dsstox_substance_id,]
+
+# add column for total number of assays each chemical was positive in 
+tested4.act[, hitsum.4assay := sum(mc.activity), by=dsstox_substance_id]
+
+tested4.act.sum <- unique(tested4.act[, c('casn','dsstox_substance_id','QC_fail','hitsum.4assay')])
+table(tested4.act.sum$hitsum.4assay)
+
+```
+
+## Supplemental Table 4
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Table defining active/ inactive/ equivocal, including activity metrics
+#-----------------------------------------------------------------------------------#
+
+act.tbl <- tbl.tested
+act.tbl[, sc.hitsum := ifelse(mc.tested==1, NA, sc.hitsum)] 
+act.tbl[, sc.n.test.end := ifelse(mc.tested==1, NA, sc.n.test.end)] 
+
+act.tbl$synonym <- short$shortname[match(act.tbl$casn, short$casn)]
+act.tbl$qc <-  qc$`P/F.Score`[match(act.tbl$dsstox_substance_id, qc$DTXSID)]
+act.tbl$qc_flags <-  qc$Flag[match(act.tbl$dsstox_substance_id, qc$DTXSID)]
+
+act.tbl <- act.tbl[, c('dsstox_substance_id','chnm.x','synonym','is.active','is.active3','qc','qc_flags','perc.active','mc.hitsum','mc.n.test.end','sc.hitsum','sc.n.test.end')] # Supplemental Table 4
+setnames(act.tbl,"chnm.x","chnm")
+setnames(act.tbl,"is.active","Active/ Inactive")
+setnames(act.tbl,"is.active3","Active/ Inactive/ Equivocal")
+
+
+```
+
+## Supplemental Table 5
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Create summary table of bioactivity by assay
+#-----------------------------------------------------------------------------------#
+
+hit.assay[, is.active := ifelse(mc.activity ==1, "Active.mc", "NA")]
+hit.assay[mc.activity==0, is.active := "Inactive.mc"]
+hit.assay[is.na(mc.activity) & sc.activity==1, is.active := "Active.sc"]
+hit.assay[is.na(mc.activity) & sc.activity==0, is.active := "Inactive.sc"]
+
+hit.wide <- dcast(hit.assay,
+                    dsstox_substance_id + QC_fail ~ assay, value.var="is.active")
+hit.wide$chnm <- test.tbl$chnm[match(hit.wide$dsstox_substance_id, test.tbl$dsstox_substance_id)]
+
+hit.wide <- hit.wide[, c(1,7,2:6)] # Supplemental Table 5
+
+```
+
+## Supplemental Table 6A
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#-----------------------------------------------------------------------------------#
+# Long format log10-AC50 values for each chemical by endpoint
+#-----------------------------------------------------------------------------------#
+
+mc.sum <- unique(mc5.neuro.pfas4[,c('casn','chnm','dsstox_substance_id','aenm','aeid','hitc','modl_ga')])
+sc.sum <- unique(sc2.neuro.pfas3[,c('casn','chnm','dsstox_substance_id','aenm','aeid','hitc')])
+sc.sum <- sc.sum[!casn %in% mc.sum$casn,]
+sc.sum[, aenm3 := paste("sc_",aenm)]
+sc.sum[, aenm := aenm3]
+
+sum.all.data <- rbind(mc.sum, sc.sum, fill=TRUE)
+sum.all.data <- sum.all.data[, c('dsstox_substance_id','chnm','aenm','aeid','hitc','modl_ga')]
+setnames(sum.all.data, "modl_ga", "log10-AC50") # Supplemental Table 6A
+
+```
+
+# 11. Concentration-response curves for active PFAS in the HCI
+
+```{r  results= "hide", warning=FALSE, message=FALSE}
+hci.active0 <- mc5.neuro.pfas4[grep("NOG",aenm),]
+graph <- mc5.neuro.pfas4[m4id %in% hci.active0$m4id & hitc==1,]
+
+# graphics.off()
+# pdf(file=paste('figures/Tcpl_plots_HCI_activity_dnt_pfas',
+#                format(Sys.Date(),
+#                       "%y%m%d.pdf"),
+#                sep="_"),
+#     height=6,
+#     width=10,
+#     pointsize=10)
+# for (a in graph$m5id){
+#   tcplPlotM4ID(graph[m5id==a]$m4id, lvl=6)
+#   mtext(paste(unique(graph[m5id==a]$aenm)), outer=FALSE, cex=1, line=1.5, adj=0)
+# }
+# graphics.off()
+
+
+```
+
+# 12. Final Table (Table 3)
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#table of high actives for manuscript
+high.active <- tbl.tested[perc.active>30, c('dsstox_substance_id','perc.active','P.F','QC.flags')]
+high.active$PFAS <- chem.sum4$chnm[match(high.active$dsstox_substance_id, chem.sum4$dsstox_substance_id)]
+high.active$CF.chain <- dat$C.chain[match(high.active$dsstox_substance_id, dat$dsstox_substance_id)]
+high.active$C.F_ratio <- dat$C_F_ratio[match(high.active$dsstox_substance_id, dat$dsstox_substance_id)]
+
+#abbreviate PFAS ToxPrints
+txp.short <- txp.long[DTXSID %in% tbl.tested$dsstox_substance_id,]
+txp.short[, Txp_cats2 := sapply(strsplit(txp.short$Txp_cat,"TxP_"),'[', 2)]
+txp.short[, txp.list := paste(Txp_cats2, collapse="; "), by=DTXSID]
+txp.short2 <- unique(txp.short[,c('DTXSID','txp.list')])
+
+high.active$Txp_cat <- txp.short2$txp.list[match(high.active$dsstox_substance_id, txp.short2$DTXSID)]
+high.active <- high.active[order(-perc.active),]
+
+write.csv(high.active, 'output/Tbl3_high_active_PFAS_c_chain.csv')
+
+```
+
+# 13. Potency distribution
+
+## ECDF plot- Potency AC50 (Figure 4A)
+Note use of non-selective data.
+```{r PFAS distrubution, results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+# All chemicals in ToxCast in the evaluated endpoints--------------------
+df <- mc5.neuro[!is.na(casn) & aenm %in% mc5.neuro.pfas3$aenm,]
+length(unique(df$casn)) #415
+
+# Subset chid to match PFAS data
+#df <- tcplSubsetChid(df)
+#write.csv(df, 'output/Subset_all_mc5_dnt_Nov22.csv')
+df <- as.data.table(read.csv('output/Subset_all_mc5_dnt_Nov22.csv'))
+
+#PFAS data prep----------------------------------------------------------
+df.pfas <- df[casn %in% mc5.neuro.pfas3$casn,]
+df.pfas <- auc_function(df.pfas)
+
+#find PFAS with most potent mean ac50
+df.pfas <- df.pfas[, mean.ac50 := mean(modl_ga, na.rm=TRUE), by=casn]
+df.pfas.min <- unique(df.pfas[,c('casn','mean.ac50')])
+allyl <- unique(df.pfas[casn %in% "15242-17-8" & hitc==1, ])
+unique(allyl[, c('chnm','aenm','hitc','modl_ga','mean.ac50')])
+med.allyl <- median(allyl$modl_ga, na.rm=TRUE)
+sd.ac50.allyl <- sd(allyl$modl_ga)
+#write.csv(allyl,'output/most_potent_pfas_mc5_allyl.csv')
+#look at tcpl plots
+# tcplPlotM4ID(allyl$m4id, lvl=6)
+# 
+# graph <- allyl
+# 
+# graphics.off()
+# pdf(file=paste('figures/Tcpl_plots_allyl_pfas',
+#                format(Sys.Date(),
+#                       "%y%m%d.pdf"),
+#                sep="_"),
+#     height=6,
+#     width=10,
+#     pointsize=10)
+# for (a in graph$m5id){
+#   tcplPlotM4ID(graph[m5id==a]$m4id, lvl=6)
+#   mtext(paste(unique(graph[m5id==a]$aenm)), outer=FALSE, cex=1, line=1.5, adj=0)
+# }
+# graphics.off()
+
+#mean(df.pfas$auc.log10, na.rm=TRUE)
+med.pfas <- median(df.pfas$modl_ga, na.rm=TRUE)
+median(df.pfas$modl_ga, na.rm=TRUE)
+sd.pfas <- sd(df.pfas$modl_ga, na.rm=TRUE)
+sd.pfas
+
+#add box in ggplot to indicate coordinates of 5th and 95th percentile pfas and median
+df.pfas[, modl_ga_fifth := quantile(modl_ga, probs=c(0.05), na.rm=TRUE)]
+modl_ga_fifth <- unique(df.pfas$modl_ga_fifth)
+df.pfas[, modl_ga_95 := quantile(modl_ga, probs=c(0.95), na.rm=TRUE)]
+modl_ga_95 <- unique(df.pfas$modl_ga_95)
+
+#find mean of Methylmercury
+mc5.merc <- df[chnm %in% "Methylmercuric(II) chloride" ,]
+med.merc <- median(mc5.merc$modl_ga, na.rm=TRUE)
+med.merc
+sd.merc <- sd(mc5.merc$modl_ga, na.rm=TRUE)
+sd.merc
+
+#find mean of "Tributyltin methacrylate"
+mc5.tribut <- df[chnm %in% "Tributyltin methacrylate"  ,]
+med.tribut <- median(mc5.tribut$modl_ga, na.rm=TRUE)
+sd.tribut <- sd(mc5.tribut$modl_ga, na.rm=TRUE)
+
+#melt table for variables and value col
+names(df.pfas)
+df.long <- melt.data.table(df, id.vars = c('casn'),
+                                measure.vars = c('modl_ga'),
+                                                 #'log10.auc.sum'),
+                                                           variable.name = 'Comparator')
+
+#plot with modl_ga
+p <- ggplot(df.long, aes(x = value, color = factor(Comparator)))+
+  labs(title="",
+       y = "Cumulative Frequency", x=expression(paste("log10 ",mu,"M")))+
+  stat_ecdf(lwd = 1.2) +
+    theme_bw()+
+  theme(text= element_text(size=16)) +
+  geom_vline(xintercept=med.tribut, linetype="dashed", color = "blue", alpha=0.4) +
+  annotate("text", x = med.tribut-0.02, y = 0.4, label = "Median\n Tributyltin", colour = "blue",
+           size=4.2, hjust=1) +
+  geom_vline(xintercept=med.merc, linetype="dashed", color = "red", alpha=0.4) +
+  annotate("text", x = med.merc-0.02, y = 0.7, label = "Median\n Methylmercury", colour = "red",
+           size=4.2, hjust=1,) +
+  
+  geom_vline(xintercept=med.pfas, linetype="dashed", color = "black", alpha=0.4) +
+  annotate("text", x = med.pfas-0.02, y = 0.85, label = paste('PFAS Median'),
+           colour = "black",hjust=1,
+           size=4) +
+    annotate("text", x = modl_ga_fifth+0.76, y = 0.15, label = "PFAS\n Potency Range",
+           colour = "black",hjust=0.5,
+           size=4.2) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(legend.position=c(0.86, 0.2))+
+  theme(legend.title=element_blank())+
+  xlim(-3,2.5)+
+  annotate(geom = "rect", xmin = modl_ga_fifth, xmax = modl_ga_95, ymin = -Inf, ymax = Inf,
+           fill = "blue", colour = "gray", alpha = 0.08) +
+
+  theme(legend.position = "none")  
+
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_ECDF_AC50_range_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 8.5, height = 5, unit='in',res = 600)
+p
+dev.off()
+
+```
+
+## ECDF plot- Efficacy AUC (Supplemental Figure 10A)
+```{r PFAS distrubution, results=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10}
+
+#all chemicals in ToxCast in the evaluated endpoints--------------------
+df <- mc5.neuro[!is.na(casn) & aenm %in% mc5.neuro.pfas3$aenm,]
+length(unique(df$casn)) #415
+
+#add AUC data
+df <- auc_function(df)
+df[, auc.sum := sum(auc, na.rm=TRUE), by=casn]
+df[, log10.auc.sum := log10(auc.sum)]
+df[, log10.auc.sum := ifelse(is.infinite(log10.auc.sum), NA, log10.auc.sum)]
+
+#PFAS data prep----------------------------------------------------------
+df.pfas <- df[casn %in% mc5.neuro.pfas3$casn,]
+
+#mean(df.pfas$auc.log10, na.rm=TRUE)
+med.pfas <- median(df.pfas$log10.auc.sum, na.rm=TRUE)
+sd.pfas <- sd(df.pfas$log10.auc.sum, na.rm=TRUE)
+
+#add box in ggplot to indicate coordinates of 5th percentile pfas and median
+df.pfas[, modl_ga_fifth := quantile(log10.auc.sum, probs=c(0.95), na.rm=TRUE)]
+modl_ga_fifth <- unique(df.pfas$modl_ga_fifth)
+
+#find PFAS with most potent mean ac50
+allyl <- unique(df.pfas[casn %in% "15242-17-8" & hitc==1, ])
+med.allyl <- median(allyl$log10.auc.sum)
+sd.auc.allyl <- sd(allyl$log10.auc.sum)
+
+#find mean of Methylmercury
+mc5.merc <- df[chnm %in% "Methylmercuric(II) chloride" ,]
+med.merc <- median(mc5.merc$log10.auc.sum, na.rm=TRUE)
+sd.merc <- sd(mc5.merc$log10.auc.sum, na.rm=TRUE)
+
+#find mean of "Tributyltin methacrylate"
+mc5.tribut <- df[chnm %in% "Tributyltin methacrylate"  ,]
+med.tribut <- median(mc5.tribut$log10.auc.sum, na.rm=TRUE)
+sd.tribut <- sd(mc5.trim$log10.auc.sum, na.rm=TRUE)
+
+#melt table for variables and value col
+names(df.pfas)
+df.long <- melt.data.table(df, id.vars = c('casn'),
+                                measure.vars = c(
+                                                 'log10.auc.sum'),
+                                                           variable.name = 'Comparator')
+
+
+#plot with AUC
+p <- ggplot(df.long, aes(x = value, color = factor(Comparator)))+
+  labs(title="",
+      y = "Cumulative Frequency", x="log10 AUC")+
+  stat_ecdf(lwd = 1.2) +
+    theme_bw()+
+  theme(text= element_text(size=16)) +
+  geom_vline(xintercept=med.tribut, linetype="dashed", color = "blue") +
+  annotate("text", x = med.tribut, y = 0.25, label = "Median\n Tributyltin", colour = "blue",
+           size=4.2, hjust=0,) +
+  geom_vline(xintercept=med.merc, linetype="dashed", color = "red") +
+  annotate("text", x = med.merc, y = 0.5, label = "Median\n Methylmercury", colour = "red",
+           size=4.2, hjust=0,) +
+
+    annotate(geom = "rect", xmin = med.pfas, xmax = modl_ga_fifth, ymin = -Inf, ymax = Inf,
+           fill = "blue", colour = "gray", alpha = 0.08) +
+    annotate("text", x = med.pfas, y = 0.1, label = paste('\u2190','\nMedian'),
+           colour = "black",hjust=0,
+           size=4) +
+    annotate("text", x = modl_ga_fifth, y = 0.07, label = paste('\u2192','\n95th %-ile'),
+           colour = "black",hjust=1,
+           size=4) +
+    annotate("text", x = modl_ga_fifth-.5, y = 0.9, label = "PFAS\n Efficacy Range",
+           colour = "black",hjust=0.5,
+           size=4.2) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(legend.position=c(0.86, 0.2))+
+  theme(legend.title=element_blank())+
+  theme(legend.position = "none") + 
+  xlim(0.5,4.5)
+
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_ECDF_AUC_range_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 9, height = 5, unit='in',res = 600)
+p
+dev.off()
+
+```
+
+## Density Plot: AC50 PFAS (HCI/NFA) compared to ALL available in NFA/HCI chemicals (Figure 4B)
+```{r Pfas density plot, warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+df[, chem.type := "Non-PFAS"]
+df[casn %in% mc5.neuro.pfas3$casn,chem.type := "PFAS"]
+df$chem.type <- factor(df$chem.type,levels=c("PFAS","Non-PFAS"))
+
+length(unique(df[chem.type %in% "Non-PFAS",casn]))
+length(unique(df[chem.type %in% "PFAS",casn]))
+
+
+p <- ggplot()+
+  geom_density(data=df, aes(x=modl_ga, fill=chem.type), alpha=0.25)+
+  theme_bw()+
+  theme(text=element_text(size=14))+
+  scale_fill_manual(breaks= c("PFAS","Non-PFAS"),
+                    values = c( "#999999", "#56B4E9"),
+                    labels= c("PFAS (124)", "Non-PFAS (291)"))+
+  xlab(expression(paste("log10 ",mu,"M")))+
+  theme(legend.title=element_blank())+
+  theme(legend.position=c(0.2,0.88))+
+  xlim(-3,3)
+  
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_density_plot_vs_other_chem_DNT_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 5, height = 4, unit='in',res = 600)
+p
+dev.off()
+```
+
+## Density Plot: AUC PFAS (HCI/NFA) compared to ALL available NFA/HCI chemicals (Supplemental Figure 10B)
+```{r Pfas density plot, warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+p <- ggplot()+
+  geom_density(data=df, aes(x=log10.auc.sum, fill=chem.type), alpha=0.25)+
+  theme(axis.text = element_text(size=14))+
+  scale_fill_manual(breaks= c("PFAS","Non-PFAS"),
+                    values = c( "#999999", "#56B4E9"),
+                    labels= c("PFAS (124)", "Non-PFAS (291)"))+
+  theme_bw()+
+  xlab("log10 AUC ")+
+  theme(legend.title=element_blank())+
+  theme(legend.position=c(0.18,0.88))+
+  xlim(0,5)
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_density_plot_vs_other_chem_AUC_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 5, height = 4, unit='in',res = 600)
+p
+dev.off()
+```
+
+## Stats of AUC between PFAS and non-PFAS
+```{r warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+#are data normally distributed
+df2 <- unique(df[,c('casn','log10.auc.sum')])
+hist(df$log10.auc.sum, col='steelblue', main='Normal') #bell shaped
+
+qqnorm(df$log10.auc.sum)
+qqline(df$log10.auc.sum) #data falls along a straight diagonal line
+shapiro.test(df$log10.auc.sum) #p<0.05 so normally distributed
+
+t.test(df[chem.type %in% "PFAS",log10.auc.sum], df[chem.type %in% "Non-PFAS",log10.auc.sum])
+
+t.test(df[chem.type %in% "PFAS",modl_ga], df[chem.type %in% "Non-PFAS",modl_ga])
+
+```
+
+# BioMAP/ ATG comparison
+
+## Load data from tcpl
+
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+# BSK------------------------------------------------------------------
+# ## Make neuro mc data package using tcpl
+# all.assays <- tcplLoadAeid()
+# bsk.aeid.tbl <- all.assays[grep("BSK_",aenm),]
+# 
+# #mc data
+# bsk.assays <- tcplLoadAcid(val=bsk.aeid.tbl$aeid, fld='aeid',add.fld='asid')
+# bsk.asid <- unique(bsk.assays$asid)
+# 
+# bsk.acid <- bsk.assays$acid
+# mc5.bsk <- tcplPrepOtpt(tcplLoadData(lvl=5,type='mc', fld='aeid',val=bsk.assays$aeid))
+# mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5.bsk$m4id, type='mc'))
+# setDT(mc6)
+# mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+# mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+# mc5.bsk$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5.bsk$m4id, mc6_mthds$m4id)]
+# mc5.bsk[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+# mc5.bsk[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+# mc5.bsk[hitc==1,acc_uM := ifelse(!is.na(modl_acc), 10^modl_ga, NA)]
+# 
+# #mc5 filters for flags
+# mc5.bsk2 <- mc5_filter(mc5.bsk)
+# 
+# #subset chid
+# mc5.bsk3 <- tcplSubsetChid(mc5.bsk2)
+# 
+# #subset BSK PFAS
+# bsk.pfas <- mc5.bsk3[casn %in% pfas.master$CASRN,]
+# 
+# #subset for all chemicals that were also screened in DNT NAMs
+# bsk.all <- mc5.bsk3[casn %in% mc5.neuro$casn,]
+# 
+# save(bsk.pfas,file="source/invitrodb_mc5_bsk_pfas.RData")
+# save(bsk.all,file="source/invitrodb_mc5_bsk_all.RData")
+
+load("source/invitrodb_mc5_bsk_pfas.RData") #bsk.pfas
+load("source/invitrodb_mc5_bsk_all.RData") #bsk.all
+
+# ATG------------------------------------------------------------------
+# # All assays in invitrodb
+# all.assays <- tcplLoadAeid()
+# atg.aeid.tbl <- all.assays[grep("ATG_",aenm),]
+# 
+# #mc data
+# atg.assays <- tcplLoadAcid(val=atg.aeid.tbl$aeid, fld='aeid',add.fld='asid')
+# atg.asid <- unique(atg.assays$asid)
+# 
+# atg.acid <- atg.assays$acid
+# mc5.atg <- tcplPrepOtpt(tcplLoadData(lvl=5,type='mc', fld='aeid',val=atg.assays$aeid))
+# mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5.atg$m4id, type='mc'))
+# setDT(mc6)
+# mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+# mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+# mc5.atg$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5.atg$m4id, mc6_mthds$m4id)]
+# mc5.atg[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+# mc5.atg[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+# mc5.atg[hitc==1,acc_uM := ifelse(!is.na(modl_acc), 10^modl_ga, NA)]
+# 
+# #mc5 filters for flags
+# mc5.atg2 <- mc5_filter(mc5.atg)
+# 
+# #subset chid
+# mc5.atg3 <- tcplSubsetChid(mc5.atg2)
+# 
+# #subset atg PFAS
+# atg.pfas <- mc5.atg3[casn %in% pfas.master$CASRN,]
+# 
+# #subset for all chemicals that were also screened in DNT NAMs
+# atg.all <- mc5.atg3[casn %in% mc5.neuro$casn,]
+# 
+# save(atg.pfas,file="source/invitrodb_mc5_atg_pfas.RData")
+# save(atg.all,file="source/invitrodb_mc5_atg_all.RData")
+
+load("source/invitrodb_mc5_atg_pfas.RData") #atg.pfas
+load("source/invitrodb_mc5_atg_all.RData") #atg.all
+```
+
+#Combine BSK and ATG data and create a range plot
+
+## Plot comparing bioactivity ranges (Figure 5)
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+#only chems in dnt pfas for atg and bsk
+atg.dnt <- atg.pfas
+bsk.dnt <- bsk.pfas
+
+#overlap between atg and bsk
+length(unique(atg.dnt$casn))
+length(unique(bsk.dnt$casn))
+intersect.data <- intersect(atg.dnt$casn,bsk.dnt$casn) #tested in both atg and bsk
+
+atg.dnt2 <- atg.dnt[casn %in% intersect.data,]
+atg.dnt2 <- atg.dnt2[casn %in% mc5.neuro.pfas4$casn,]
+bsk.dnt2 <- bsk.dnt[casn %in% intersect.data,]
+bsk.dnt2 <- bsk.dnt2[casn %in% mc5.neuro.pfas4$casn,]
+
+#add mean,lower,upper
+atg.dnt2[, mean := mean(modl_ga, na.rm=TRUE), by='casn']
+atg.dnt2[, lower := quantile(modl_ga, probs=c(0.25), na.rm=TRUE), by=list(chid)]
+atg.dnt2[, upper := quantile(modl_ga, probs=c(0.75), na.rm=TRUE), by=list(chid)]
+atg.dnt2[, source := "atg"]
+
+bsk.dnt2[, mean := mean(modl_ga, na.rm=TRUE), by='casn']
+bsk.dnt2[, lower := quantile(modl_ga, probs=c(0.25), na.rm=TRUE), by=list(chid)]
+bsk.dnt2[, upper := quantile(modl_ga, probs=c(0.75), na.rm=TRUE), by=list(chid)]
+bsk.dnt2[, source := "bsk"]
+
+#dnt nam data
+dnt.df3 <- mc5.neuro.pfas3[casn %in% intersect.data,] #99 overlap
+dnt.df3[, modl_ga_dnt := modl_ga]
+dnt.df3[, hitsum := sum(hitc), by=casn]
+
+#dnt.df3[hitsum==1, modl_ga_dnt := NA, by=casn]
+dnt.df3[, mean := mean(modl_ga_dnt, na.rm=TRUE), by='casn']
+
+dnt.df3[, lower := quantile(modl_ga_dnt, probs=c(0.25), na.rm=TRUE), by=list(chid)]
+dnt.df3[, upper := quantile(modl_ga_dnt, probs=c(0.75), na.rm=TRUE), by=list(chid)]
+dnt.df3[, source := "dnt"]
+
+atg.dnt3 <- unique(atg.dnt2[,c('casn','dsstox_substance_id','mean','lower','upper','source')])
+bsk.dnt3 <- unique(bsk.dnt2[,c('casn','dsstox_substance_id','mean','lower','upper','source')])
+dnt.df4 <- unique(dnt.df3[,c('casn','dsstox_substance_id','mean','lower','upper','source')])
+
+range.df <- rbind(atg.dnt3,bsk.dnt3,dnt.df4)
+range.df[, assay.check := .N, by='casn']
+range.df$mean.dnt <- dnt.df3$mean[match(range.df$casn,dnt.df3$casn)]
+range.df$mean.bsk <- bsk.dnt2$mean[match(range.df$casn,bsk.dnt2$casn)]
+range.df$mean.atg <- atg.dnt2$mean[match(range.df$casn,atg.dnt2$casn)]
+
+#summary table for abstract results
+range.sum <- unique(range.df[, c('casn','dsstox_substance_id','mean.dnt','mean.bsk','mean.atg')])[order(mean.dnt, mean.bsk,mean.atg),]
+
+write.csv(range.sum,'output/dnt_bsk_atg_sum_tbl.csv')
+
+length(range.sum[!is.na(mean.dnt),casn])
+length((range.sum[!is.na(mean.dnt) &
+                    is.na(mean.bsk) &
+                    is.na(mean.atg), casn]))#5/34 were only active in DNT and 29/34 positive in dnt were positive in atg or bsk
+length(range.sum[is.na(mean.dnt),casn])
+length((range.sum[is.na(mean.dnt) &
+                    (!is.na(mean.bsk) |
+                    !is.na(mean.atg)), casn]))#Out of 65 PFAS that were inactive in DNT, 51 were active in bsk or atg
+
+#only active-----------------------
+active.casn <- tbl.tested[is.active %in% "Active",casn]
+range.df2 <- range.df[casn %in% active.casn,]
+
+range.df2 <- range.df2 %>% mutate(casn= ifelse(casn %in% short$casn, paste(short$shortname),casn))
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+p <- ggplot(range.df2, aes(x=reorder(factor(dsstox_substance_id),mean.dnt), mean, colour = factor(source)))+
+  geom_pointrange(aes(ymin = lower, ymax = upper))+
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"),
+                     labels=c("Attagene","BioMAP","DNT"))+
+  labs(y="Potency Range AC50-uM", color="Source")+
+  labs(color="Source")+
+  theme_bw()+
+  theme(axis.title.y = element_blank()) +
+  coord_flip()
+  
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_BSK_ATG_DNT_active_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 8, height = 5, unit='in',res = 600)
+p
+dev.off()
+
+# Extract data for manuscript
+unique(mc5.neuro[casn %in% "90177-96-1",chnm])
+data1 <- range.df2[casn %in% "90177-96-1",]
+1.2041--0.28649
+unique(mc5.neuro[casn %in% "423-65-4",chnm])
+data2 <- range.df2[casn %in% "423-65-4",]
+data2
+0.7431857--0.7431857
+1.8202587--0.7431857
+unique(mc5.neuro[casn %in% "754-96-1",chnm])
+data2 <- range.df2[casn %in% "754-96-1",]
+data2
+1.297974-0.9274241
+
+#-----------------------------------------------------------------------------------#
+# Evaluate PFAS that were inactive in DNT
+#-----------------------------------------------------------------------------------#
+range.df2 <- range.df[!casn %in% active.casn,]
+range.df2 <- range.df2 %>% mutate(casn= ifelse(casn %in% short$casn, paste(short$shortname),casn))
+names(range.df2)
+range.df2 <- range.df2 %>% group_by(mean.bsk, mean.atg)
+
+#-----------------------------------------------------------------------------------#
+# Plot
+#-----------------------------------------------------------------------------------#
+p <- ggplot(range.df2, aes(x=reorder(factor(dsstox_substance_id),mean.atg), mean, colour = factor(source)))+
+  geom_pointrange(aes(ymin = lower, ymax = upper))+
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"),
+                     labels=c("Attagene","BioMAP","DNT"))+
+  labs(y="Potency Range AC50-uM", color="Source")+
+  labs(color="Source")+
+  theme_bw()+
+  theme(axis.title.y = element_blank()) +
+  coord_flip()
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_BSK_ATG_DNT_inactive_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 8, height = 10, unit='in',res = 600)
+p
+dev.off()
+
+```
+
+## Density Plot: PFAS in DNT NAM vs ATG and BioMap (Supplemental Figure 11B)
+```{r Pfas density plot, warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+# find intersect of all 
+pfas.all <- Reduce(intersect,list(atg.pfas$casn,bsk.pfas$casn,mc5.neuro.pfas3$casn))
+atg.pfas[, assay := "Attagene"]
+bsk.pfas[, assay := "BioMap"]
+mc5.neuro.pfas3[, assay := "DNT"]
+
+df3 <- as.data.table(rbind.fill(atg.pfas,bsk.pfas,mc5.neuro.pfas3))
+df3 <- df3[casn %in% pfas.all,]
+
+p <- ggplot()+
+  geom_density(data=df3, aes(x=modl_ga, fill=assay), alpha=0.25)+
+  # scale_fill_manual(breaks= c("PFAS","Non-PFAS"),
+  #                   values = c( "#999999", "#56B4E9"))+
+  theme_bw()+
+  xlab(expression(paste("log10 ",mu,"M")))+
+  theme(legend.title=element_blank())+
+  theme(legend.position=c(0.17,0.84))+
+  #xlim(0,5)+
+  theme(axis.text = element_text(size=14))
+  
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_PFAS_density_plot_DNT_atg_bsk_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 5, height = 4, unit='in',res = 600)
+p
+dev.off()
+```
+
+## Density Plot: non-PFAS DNT NAM vs ATG and BioMap (Supplemental Figure 11C)
+```{r Pfas density plot, warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+# find intersect of all 
+length(unique(mc5.neuro$casn))
+mc5.neuro2 <- mc5.neuro[aenm %in% mc5.neuro.pfas4$aenm,]
+length(unique(mc5.neuro2$casn))
+
+all.chems <- Reduce(intersect,list(atg.all$casn,bsk.all$casn,mc5.neuro2$casn))
+atg.all[, assay := "Attagene"]
+bsk.all[, assay := "BioMap"]
+mc5.neuro2[, assay := "DNT"]
+
+df3 <- as.data.table(rbind.fill(atg.all,bsk.all,mc5.neuro2))
+df3 <- df3[casn %in% all.chems,]
+df3 <- df3[!casn %in% mc5.neuro.pfas4$casn,]
+
+length(unique(df3[assay %in% "Attagene",casn]))
+length(unique(df3[assay %in% "BioMap",casn]))
+length(unique(df3[assay %in% "DNT",casn]))
+
+p <- ggplot()+
+  geom_density(data=df3, aes(x=modl_ga, fill=assay), alpha=0.2)+
+  # scale_fill_manual(breaks= c("PFAS","Non-PFAS"),
+  #                   values = c( "#999999", "#56B4E9"))+
+  theme_bw()+
+  xlab(expression(paste("log10 ",mu,"M")))+
+  theme(legend.title=element_blank())+
+  theme(legend.position=c(0.17,0.84))+
+  #xlim(0,5)+
+  theme(axis.text = element_text(size=14))
+  
+p
+
+file.dir <- paste("./figures/", sep="")
+file.name <- paste("/Fig_ALL_chems_density_plot_DNT_atg_bsk_", Sys.Date(), ".png", sep="")
+file.path <- paste(file.dir, file.name, sep="")
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width = 5, height = 4, unit='in',res = 600)
+p
+dev.off()
+
+# stats for manuscript
+df3[, mean(modl_ga, na.rm=TRUE), by=assay]
+df3[, sd(modl_ga, na.rm=TRUE), by=assay]
+
+t.test(df3[assay %in% "DNT",modl_ga], df3[assay %in% "Attagene",modl_ga])
+t.test(df3[assay %in% "DNT",modl_ga], df3[assay %in% "BioMap",modl_ga])
+```
+
+
+## Bootstrap resample: non-PFAS DNT NAM vs ATG and BioMap
+```{r , warning=FALSE, message=FALSE, fig.height=5, fig.width=8}
+
+#Method1------------------------------------------
+#https://stats.stackexchange.com/questions/136661/using-bootstrap-under-h0-to-perform-a-test-for-the-difference-of-two-means-repl
+df4 <- df3[assay %in% c("DNT","Attagene"), c("modl_ga","assay")]
+x <- df4[assay %in% c("DNT") & !is.na(modl_ga) , c("modl_ga")]
+x <- x$modl_ga
+y <- df4[assay %in% c("Attagene") & !is.na(modl_ga), c("modl_ga")]
+y <- y$modl_ga
+
+t.test(x,y)
+
+#are there population means equal
+
+# pooled sample, assumes equal variance
+pooled <- c(x,y)
+for (i in 1:10000){
+  sample.index <- sample(c(1:length(pooled)),replace=TRUE)
+  sample.x <- pooled[sample.index][1:length(x)]
+  sample.y <- pooled[sample.index][-c(1:length(y))]
+  boot.t[i] <- t.test(sample.x,sample.y)$statistic
+}
+p.pooled <-  (1 + sum(abs(boot.t) >= abs(t.test(x,y)$statistic))) / (10000+1) 
+p.pooled
+
+#Null hypothesis: no difference between DNT and Attagene
+#Alt hypothesis: DNT modl_ga's are less than attagene modl_ga's
+
+
+#don't assume normal variance (failed the bartlett test, below)
+# sample from H0 separately, no assumption about equal variance
+xt <- x - mean(x) + mean(pooled)
+yt <- y - mean(y) + mean(pooled)
+
+boot.t <- c(1:1000)
+for (i in 1:1000){
+  sample.x <- sample(xt,replace=TRUE)
+  sample.y <- sample(yt,replace=TRUE)
+  boot.t[i] <- t.test(sample.x,sample.y)$statistic
+}
+p.h0 <-  (1 + sum(abs(boot.t) >= abs(t.test(x,y)$statistic))) / (1000+1)  #permutation test
+p.h0
+
+#Method2----------------------------------------------
+#https://www.roelpeters.be/how-to-do-a-two-sample-bootstrap-of-the-mean-in-r/
+library(simpleboot)
+bootstrapped <- two.boot(x, y, mean, 2500)
+#extract data in table
+bootstrapped_mean_diff <- data.frame(bootstrapped$t)
+colnames(bootstrapped_mean_diff) <- 'mean_diffs'
+
+ggplot(bootstrapped_mean_diff, aes(x=mean_diffs)) + 
+  geom_histogram(bins=20, alpha=0.8) +
+  geom_vline(xintercept = bootstrapped$t0, size = 1.5) +
+  geom_vline(xintercept = quantile(bootstrapped_mean_diff$mean_diffs, 0.05), size = 1, linetype = 'dashed') +
+  geom_vline(xintercept = quantile(bootstrapped_mean_diff$mean_diffs, 0.95), size = 1, linetype = 'dashed') +
+  xlab('sample mean') + ylab('bootstrapped count')
+
+
+#Method3------------------------------------------------
+#https://nickwisniewski.com/M200/t-test_tutorial_2.html
+df4 <- df3[assay %in% c("DNT","Attagene"), c("modl_ga","assay")]
+X <- df4[assay %in% c("DNT") & !is.na(modl_ga) , c("modl_ga")]
+X <- X$modl_ga
+Y <- df4[assay %in% c("Attagene") & !is.na(modl_ga), c("modl_ga")]
+Y <- Y$modl_ga
+
+shapiro.test(X) #normal distribution
+shapiro.test(Y) #normal distribution
+library(car)
+bartlett.test(modl_ga ~ assay, data=df4) #is the variance between groups different
+
+
+#use one-box bootstrap because the non-PFAS chemicals are the same in each group (one population)
+# test statistic: difference in means
+dstat <- function(x1, x2, center=mean){
+    d <- center(x1) - center(x2)
+    return(d)
+}
+
+# test statistic: Student's t
+tstat <- function(x1, x2, center=mean, spread=sd){
+    d <- center(x1) - center(x2) # difference in means
+    n1 <- length(x1)
+    n2 <- length(x2)
+    s <- ((n1-1)*spread(x1)^2 + (n2-1)*spread(x2)^2) / (n1+n2-2) / sqrt((1/n1)+(1/n2))
+    t <- d/s
+    return(t)
+}
+
+nboot <- 10000  # number of bootstraps
+d <- numeric()
+d0 <- tstat(X,Y)  # actual test statistic
+for(i in 1:nboot){
+    x <- sample( c(X,Y), length(X), replace=T)  # resample new x group
+    y <- sample( c(X,Y), length(Y), replace=T)  # resample new y group
+    d[i] <- tstat(x, y)  # bootstrap test statistic
+}
+p.onebox <- sum(abs(d)>=abs(d0))/nboot  # compute two-sided p-value
+p.onebox
+
+
+
+```
+
+# Create Final Supp Table File
+```{r  results= "hide", warning=FALSE, message=FALSE}
+
+mc5.sc2.methods <- read.xlsx('output/Supp_tbl6_mc5_sc2_methods.xlsx')
+read.me <- read.xlsx('input/README_supplementals.xlsx')
+
+list.supp <- list('README'= read.me,
+                  'SuppTb1'=chem.sum4,
+                  'SuppTb2A'=end.sum.wide,
+                  'SuppTb2B'=test.tbl,
+                  'SuppTb3'=mc5.sc2.methods,
+                  'SuppTb4'=act.tbl,
+                  'SuppTb5'=hit.wide,
+                  'SuppTb6A'=sum.all.data,
+                  'SuppTb6B'=sum.stats.pot,
+                  'SuppTb7'=txp729.sig,
+                  'SuppTb8'=txp729.sig.no.fail,
+                  'SuppTb9'=txp34.for.supp, 
+                  'SuppTb10'=txp34.sig.all,
+                  'SuppTb11'=txp34.sig.no.fail)
+
+
+write.xlsx(list.supp, file='./output/Supp_tbls_manuscript_2022.xlsx', overwrite=TRUE)
+
+```
